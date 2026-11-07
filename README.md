@@ -232,9 +232,9 @@ Grouped options accept `true`, `false`, **or** an object of settings — so `vid
 
 ### Local preview cache and album rotation
 
-The optional server-side cache stores Immich previews on local disk. It is
-disabled by default; videos continue to stream from Immich, while video posters
-use the image cache.
+The optional server-side cache stores Immich image previews and video posters on
+local disk. It is disabled by default; video playback itself continues to stream
+from Immich.
 
 | Name | Type | Default | Description |
 |---|---|---|---|
@@ -243,9 +243,10 @@ use the image cache.
 | `cache.maxBytes` | number | `8589934592` | Maximum cache size (8 GiB). The oldest unprotected previews are evicted first. |
 | `cache.concurrency` | number | `2` | Maximum number of preview downloads in flight; valid range is 1–8. |
 | `albumRotation` | boolean \| object | `false` | Rotate through selected albums while preparing the next album in the background. |
-| `albumRotation.intervalMinutes` | number | `60` | Time to show each album. If preparation is late, the current album remains visible and the helper retries every five minutes. |
+| `albumRotation.intervalMinutes` | number | `60` | Time to show each album. If preparation is late, the current album remains visible. |
+| `albumRotation.alignToHour` | boolean | `false` | With a 60-minute interval, switch at local `HH:00` boundaries. If the next album is not ready, keep the current one until the next hour. |
 | `albumRotation.albums` | array \| string | `[]` | Exact album names or IDs to include. |
-| `albumRotation.patterns` | array \| RegExp | `[]` | Regular-expression source strings or RegExp values matched against album names. Exact names and patterns are combined. |
+| `albumRotation.patterns` | array \| RegExp | `[]` | Regular-expression source strings or RegExp values matched against album names. Use a RegExp literal with the `u` flag for Unicode emoji properties. Exact names and patterns are combined. |
 
 If both album selectors are empty, rotation uses the album names and IDs from
 `immich.album`. The current album from `immich.album` is used as the starting
@@ -255,6 +256,10 @@ The active and next albums are protected from eviction while the next album is
 being prepared. When the configured size limit prevents storing a preview, that
 image still loads through the normal Immich proxy. A cache directory on a USB
 SSD can be selected with an absolute path after the drive is mounted.
+The selected album name is shown at the bottom-left of the display. A preview
+that is not yet cached is fetched through Immich, so its first appearance can
+wait on the network; later appearances use the local cache while the entry
+remains cached.
 
 ```js
 config: {
@@ -267,8 +272,9 @@ config: {
   albumRotation: {
     enabled: true,
     intervalMinutes: 60,
+    alignToHour: true,
     albums: [],
-    patterns: ["^\\d{4}( [^-].*)?$"]
+    patterns: [/^\d{4}\s+(?:\p{Extended_Pictographic}|\p{Regional_Indicator}{2})/u]
   },
   immich: {
     url: "http://your-immich-host:2283",
@@ -284,7 +290,7 @@ config: {
 The module detects your Immich version and picks the right endpoints, then proxies media through MagicMirror so no credentials reach the browser.
 
 - **Images** — proxied Immich thumbnails. With `performance.lightweight`, the smaller `thumbnail` is tried first, then `preview`, then the original. Otherwise `preview` first.
-- **Videos** — the encoded video stream (v1.x `/assets/{id}/video`, v3+ `/assets/{id}/video/playback`) with a thumbnail poster.
+- **Videos** — the encoded video stream (v1.x `/assets/{id}/video`, v3+ `/assets/{id}/video/playback`) with a thumbnail poster. The poster is cached and preloaded like a photo; playback remains a network stream from Immich.
 - **Large albums** — on Immich v3+, album assets are paged via `/search/metadata` and stream to the browser as they arrive, so a 6,000-photo album starts rendering after the first page instead of blocking.
 - **Local caching** — optional preview caching is keyed by asset version and rendition, so unchanged previews can be served without another NAS request. The active album is shown immediately; the next selected album is loaded and cached before the scheduled switch.
 
@@ -305,7 +311,7 @@ On pre-v3 servers `asset.read` also covers thumbnails and originals — the `ass
 ## Tests
 
 Run the built-in tests with `npm test`. They cover cache persistence, size limits,
-protected assets, and cache/rotation configuration validation.
+protected assets, video-poster preloading, and cache/rotation configuration validation.
 
 ## Migrating from v1
 

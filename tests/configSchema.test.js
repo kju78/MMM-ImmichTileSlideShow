@@ -12,11 +12,13 @@ const albumConfig = {
   album: 'Current album'
 };
 
+const yearAndEmoji = /^\d{4}\s+(?:\p{Extended_Pictographic}|\p{Regional_Indicator}{2})/u;
+
 test('normalizes cache and album rotation settings, including RegExp patterns', () => {
   const config = normalize({
     immich: albumConfig,
     cache: { enabled: true, directory: '/tmp/immich-cache', maxBytes: 2048, concurrency: 3 },
-    albumRotation: { enabled: true, intervalMinutes: 45, patterns: [/^2026/i] }
+    albumRotation: { enabled: true, intervalMinutes: 60, alignToHour: true, patterns: [yearAndEmoji] }
   });
 
   assert.deepEqual(config.cache, {
@@ -25,8 +27,15 @@ test('normalizes cache and album rotation settings, including RegExp patterns', 
     concurrency: 3,
     enabled: true
   });
-  assert.deepEqual(config.albumRotation.patterns, [{ source: '^2026', flags: 'i' }]);
-  assert.equal(config.albumRotation.intervalMinutes, 45);
+  assert.deepEqual(config.albumRotation.patterns, [{ source: yearAndEmoji.source, flags: 'u' }]);
+  assert.equal(config.albumRotation.intervalMinutes, 60);
+  assert.equal(config.albumRotation.alignToHour, true);
+
+  const pattern = new RegExp(config.albumRotation.patterns[0].source, config.albumRotation.patterns[0].flags);
+  assert.equal(pattern.test('2026 🏕️ Husbilsresan'), true);
+  assert.equal(pattern.test('2026 🇸🇪 Sommar'), true);
+  assert.equal(pattern.test('2026 Semester'), false);
+  assert.equal(pattern.test('2026'), false);
 });
 
 test('rejects invalid rotation patterns and non-album rotation sources', () => {
@@ -34,6 +43,11 @@ test('rejects invalid rotation patterns and non-album rotation sources', () => {
     immich: albumConfig,
     albumRotation: { enabled: true, patterns: ['['] }
   }), /albumRotation\.patterns\[0\] is invalid/);
+
+  assert.throws(() => normalize({
+    immich: albumConfig,
+    albumRotation: { enabled: true, intervalMinutes: 45, alignToHour: true }
+  }), /albumRotation\.alignToHour requires intervalMinutes to be 60/);
 
   assert.throws(() => normalize({
     immich: { ...albumConfig, source: 'search' },

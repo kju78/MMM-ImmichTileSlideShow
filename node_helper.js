@@ -14,6 +14,7 @@ const path = require("path");
 const fs = require("fs");
 
 const LOG_PREFIX = "MMM-ImmichTileSlideShow :: helper :: ";
+const ROTATION_RETRY_MS = 5 * 60 * 1000;
 
 function dlog(ctx, ...args) {
   if (ctx && ctx.config && ctx.config.debug) {
@@ -204,7 +205,7 @@ function toTileImage(img, immichApi, isVideo) {
  * Filter a raw Immich asset list by valid extension/type and map to tile records.
  * Extracted so progressive per-page emission and the final aggregated path share logic.
  */
-function _filterAndMap(rawAssets, immichApi, context, validImageSet, validVideoSet) {
+function _filterAndMap(rawAssets, immichApi, context, validImageSet, validVideoSet, albumName) {
   if (!Array.isArray(rawAssets) || rawAssets.length === 0) return [];
   const filtered = rawAssets.filter((img) => {
     const name = img.originalPath || img.originalFileName || '';
@@ -219,7 +220,9 @@ function _filterAndMap(rawAssets, immichApi, context, validImageSet, validVideoS
     const name = img.originalPath || img.originalFileName || '';
     const type = (img.type || '').toString().toLowerCase();
     const isVideo = type.includes('video') || (!type && hasValidExt(name, validVideoSet));
-    return toTileImage(img, immichApi, isVideo);
+    const tile = toTileImage(img, immichApi, isVideo);
+    if (albumName) tile.albumName = albumName;
+    return tile;
   });
 }
 
@@ -331,9 +334,20 @@ function _scheduleAlbumRotation(context, delay) {
   context._albumRotationTimer = setTimeout(() => {
     _rotateAlbum(context).catch((error) => {
       Log.error(LOG_PREFIX + 'album rotation failed: ' + error.message);
-      _scheduleAlbumRotation(context, 5 * 60 * 1000);
+      const state = context._albumRotationState;
+      if (state) _scheduleAlbumRotation(context, _rotationDelay(state, true));
     });
   }, delay);
+}
+
+function _delayUntilNextHour() {
+  const now = new Date();
+  return (60 - now.getMinutes()) * 60 * 1000 - now.getSeconds() * 1000 - now.getMilliseconds();
+}
+
+function _rotationDelay(state, retry = false) {
+  if (state.alignToHour) return _delayUntilNextHour();
+  return retry ? ROTATION_RETRY_MS : state.intervalMs;
 }
 
 async function _prepareNextAlbum(context) {
@@ -366,11 +380,12 @@ async function _rotateAlbum(context) {
   const state = context._albumRotationState;
   if (!state) return;
   if (!state.stage) {
-    Log.warn(LOG_PREFIX + 'Next album is not ready; keeping the current album and retrying shortly.');
+    const retryAt = state.alignToHour ? 'the next local hour' : 'in five minutes';
+    Log.warn(LOG_PREFIX + `Next album is not ready; keeping the current album and retrying ${retryAt}.`);
     _prepareNextAlbum(context).catch((error) => {
       Log.error(LOG_PREFIX + 'Could not prepare next album: ' + error.message);
     });
-    _scheduleAlbumRotation(context, 5 * 60 * 1000);
+    _scheduleAlbumRotation(context, _rotationDelay(state, true));
     return;
   }
 
@@ -380,13 +395,16 @@ async function _rotateAlbum(context) {
   state.stage = null;
   const immichApi = require('./immichApi.js');
   if (immichApi.previewCache) immichApi.previewCache.setProtectedAssets(state.currentTiles);
-  context.sendSocketNotification('IMMICH_TILES_DATA', { images: state.currentTiles });
+  context.sendSocketNotification('IMMICH_TILES_DATA', {
+    images: state.currentTiles,
+    albumName: next.album.name
+  });
   Log.info(LOG_PREFIX + `Switched to album ${next.index + 1}/${state.candidates.length}.`);
 
   _prepareNextAlbum(context).catch((error) => {
     Log.error(LOG_PREFIX + 'Could not prepare next album: ' + error.message);
   });
-  _scheduleAlbumRotation(context, state.intervalMs);
+  _scheduleAlbumRotation(context, _rotationDelay(state));
 }
 
 async function _startAlbumRotation(context) {
@@ -415,9 +433,13 @@ async function _startAlbumRotation(context) {
     currentTiles: [],
     stage: null,
     preparing: null,
-    intervalMs: context.config.albumRotation.intervalMinutes * 60 * 1000
+    intervalMs: context.config.albumRotation.intervalMinutes * 60 * 1000,
+    alignToHour: context.config.albumRotation.alignToHour === true
   };
-  Log.info(LOG_PREFIX + `Album rotation selected ${candidates.length} album(s); interval is ${context.config.albumRotation.intervalMinutes} minute(s).`);
+  const schedule = state.alignToHour
+    ? 'at each local hour boundary'
+    : `every ${context.config.albumRotation.intervalMinutes} minute(s)`;
+  Log.info(LOG_PREFIX + `Album rotation selected ${candidates.length} album(s); switching ${schedule}.`);
   context._albumRotationState = state;
   state.currentTiles = await _loadFromImmichImpl(context, {
     album: candidates[currentIndex],
@@ -429,7 +451,7 @@ async function _startAlbumRotation(context) {
   _prepareNextAlbum(context).catch((error) => {
     Log.error(LOG_PREFIX + 'Could not prepare next album: ' + error.message);
   });
-  _scheduleAlbumRotation(context, state.intervalMs);
+  _scheduleAlbumRotation(context, _rotationDelay(state));
 }
 
 /**
@@ -462,6 +484,15 @@ async function _loadFromImmichImpl(context, options) {
   const validVideoSet = new Set(context.config.videoExtensions || []);
 
   if (!options.skipInit) await _initializeImmich(context, cfg, true);
+  let albumName = options.album && options.album.name ? options.album.name : null;
+  if (!albumName && cfg.source === 'album' && (cfg.albumNames || []).length === 1) {
+    albumName = cfg.albumNames[0];
+  }
+  if (!albumName && cfg.source === 'album' && (cfg.albumIds || []).length === 1) {
+    const albumMap = await immichApi.getAlbumNameToIdMap();
+    const selected = Array.from(albumMap.entries()).find(([, id]) => String(id) === String(cfg.albumIds[0]));
+    if (selected) albumName = selected[0];
+  }
   if (immichApi.previewCache && !options.keepCachePins) immichApi.previewCache.setProtectedAssets([]);
 
   let images = [];
@@ -487,7 +518,7 @@ async function _loadFromImmichImpl(context, options) {
 
       const onPage = (items) => {
         appendedRaw.push(...items);
-        const pageTiles = _filterAndMap(items, immichApi, context, validImageSet, validVideoSet);
+        const pageTiles = _filterAndMap(items, immichApi, context, validImageSet, validVideoSet, albumName);
         if (!pageTiles.length) return;
         if (sortMode === 'random' && !needsFinalSort) shuffle(pageTiles);
         progressiveTiles.push(...pageTiles);
@@ -501,10 +532,10 @@ async function _loadFromImmichImpl(context, options) {
         if (!firstPageSent) {
           firstPageSent = true;
           Log.info(LOG_PREFIX + `First page ready — sending ${pageTiles.length} tile(s) to frontend`);
-          context.sendSocketNotification('IMMICH_TILES_DATA', { images: pageTiles });
+          context.sendSocketNotification('IMMICH_TILES_DATA', { images: pageTiles, albumName });
         } else {
           dlog(context, `appending ${pageTiles.length} tile(s) to pool`);
-          context.sendSocketNotification('IMMICH_TILES_APPEND', { images: pageTiles });
+          context.sendSocketNotification('IMMICH_TILES_APPEND', { images: pageTiles, albumName });
         }
       };
 
@@ -583,7 +614,9 @@ async function _loadFromImmichImpl(context, options) {
     const name = img.originalPath || img.originalFileName || '';
     const type = (img.type || '').toString().toLowerCase();
     const isVideo = type.includes('video') || (!type && hasValidExt(name, validVideoSet));
-    return toTileImage(img, immichApi, isVideo);
+    const tile = toTileImage(img, immichApi, isVideo);
+    if (albumName) tile.albumName = albumName;
+    return tile;
   });
   dlog(context, 'mapped tiles', tiles && tiles.length);
   if (cfg.source !== 'album' && immichApi.previewCache) {
@@ -602,7 +635,7 @@ async function _loadFromImmichImpl(context, options) {
 
   // Send to client
   Log.info(LOG_PREFIX + `Loaded ${tiles.length} image(s) for source=${cfg.source}`);
-  context.sendSocketNotification('IMMICH_TILES_DATA', { images: tiles });
+  context.sendSocketNotification('IMMICH_TILES_DATA', { images: tiles, albumName });
   return tiles;
 }
 

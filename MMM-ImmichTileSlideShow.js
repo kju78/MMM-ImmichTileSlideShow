@@ -121,6 +121,8 @@ Module.register("MMM-ImmichTileSlideShow", {
     }
 
     this.images = /** @type {TileImage[]} */ ([]);
+    this._albumName = '';
+    this._albumLabel = null;
     this.tileEls = [];
     this._rotationTimer = null;
     this._featuredTimer = null;
@@ -213,6 +215,7 @@ Module.register("MMM-ImmichTileSlideShow", {
   socketNotificationReceived(notification, payload) {
     if (notification === "IMMICH_TILES_DATA" && payload && Array.isArray(payload.images)) {
       this.log("received images:", payload.images.length);
+      this._setAlbumLabel(payload.albumName);
       this.images = payload.images;
       this._splitMedia();
       this._cadenceIndex = 0;
@@ -227,6 +230,7 @@ Module.register("MMM-ImmichTileSlideShow", {
       // Progressive album loading: append subsequent pages to the existing pool
       // without disturbing rotation or already-rendered tiles.
       this.log("appending images:", payload.images.length);
+      this._setAlbumLabel(payload.albumName);
       if (!Array.isArray(this.images)) this.images = [];
       this.images.push(...payload.images);
       for (const m of payload.images) {
@@ -367,6 +371,14 @@ Module.register("MMM-ImmichTileSlideShow", {
     dbg.className = 'immich-tiles-debug';
     dbg.style.cssText = 'position:absolute;left:8px;bottom:8px;color:#8bc34a;font:12px/1.2 monospace;background:rgba(0,0,0,.35);padding:4px 6px;border-radius:4px;display:none;';
     root.appendChild(dbg);
+
+    const albumLabel = document.createElement('div');
+    albumLabel.className = 'immich-album-name';
+    albumLabel.setAttribute('aria-live', 'polite');
+    albumLabel.textContent = this._albumName;
+    albumLabel.style.display = this._albumName ? 'block' : 'none';
+    root.appendChild(albumLabel);
+    this._albumLabel = albumLabel;
 
     this._container = wrapper;
     return root;
@@ -691,6 +703,14 @@ Module.register("MMM-ImmichTileSlideShow", {
     } catch (_) {}
     this._root = null;
     this._container = null;
+    this._albumLabel = null;
+  },
+
+  _setAlbumLabel(name) {
+    this._albumName = typeof name === 'string' ? name.trim() : '';
+    if (!this._albumLabel) return;
+    this._albumLabel.textContent = this._albumName;
+    this._albumLabel.style.display = this._albumName ? 'block' : 'none';
   },
 
   _setDebugText(text) {

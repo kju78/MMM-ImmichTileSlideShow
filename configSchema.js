@@ -344,12 +344,17 @@
 
     const albumRotation = group(raw.albumRotation, {
       intervalMinutes: 60,
+      alignToHour: false,
       albums: [],
       patterns: []
     }, false);
     albumRotation.intervalMinutes = Number(albumRotation.intervalMinutes);
     if (!Number.isFinite(albumRotation.intervalMinutes) || albumRotation.intervalMinutes < 1) {
       throw new Error('albumRotation.intervalMinutes must be at least 1.');
+    }
+    albumRotation.alignToHour = albumRotation.alignToHour === true;
+    if (albumRotation.alignToHour && albumRotation.intervalMinutes !== 60) {
+      throw new Error('albumRotation.alignToHour requires intervalMinutes to be 60.');
     }
     albumRotation.albums = stringList(albumRotation.albums, 'albumRotation.albums');
     albumRotation.patterns = patternList(albumRotation.patterns);

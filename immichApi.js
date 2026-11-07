@@ -618,16 +618,18 @@ const immichApi = {
   },
 
   prefetchTiles: async function (tiles) {
-    const images = (tiles || []).filter((tile) => tile && tile.kind !== 'video' && tile.assetId);
-    if (!this.previewCache || !images.length) return { requested: images.length, cached: 0, failed: 0 };
+    const previews = (tiles || []).filter((tile) =>
+      tile && tile.assetId && (tile.kind !== 'video' || Boolean(tile.posterSrc))
+    );
+    if (!this.previewCache || !previews.length) return { requested: previews.length, cached: 0, failed: 0 };
 
-    this.previewCache.addProtectedAssets(images);
+    this.previewCache.addProtectedAssets(previews);
     let nextIndex = 0;
     let cached = 0;
     let failed = 0;
     const worker = async () => {
-      while (nextIndex < images.length) {
-        const tile = images[nextIndex++];
+      while (nextIndex < previews.length) {
+        const tile = previews[nextIndex++];
         try {
           if (await this._prefetchPreview(tile.assetId, tile.assetVersion, tile.cacheVariant)) cached += 1;
           else failed += 1;
@@ -638,9 +640,9 @@ const immichApi = {
       }
     };
 
-    const workerCount = Math.min(this.previewCache.concurrency, images.length);
+    const workerCount = Math.min(this.previewCache.concurrency, previews.length);
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
-    return { requested: images.length, cached, failed };
+    return { requested: previews.length, cached, failed };
   },
 
   getImageLink: function (imageId, version) {
