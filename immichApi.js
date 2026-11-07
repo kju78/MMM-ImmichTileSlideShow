@@ -3,8 +3,12 @@
 
 const Log = require('logger');
 const axios = require('axios');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 // http-proxy-middleware no longer used; custom routes stream with fallback
 
+const PreviewCache = require('./previewCache');
 const LOG_PREFIX = 'MMM-ImmichTileSlideShow :: immichApi :: ';
 const IMMICH_PROXY_URL = '/immichtilesslideshow/';
 const IMMICH_VIDEO_PROXY_URL = '/immichtilesslideshow-video/';
@@ -90,6 +94,8 @@ const immichApi = {
   apiBaseUrl: '/api',
   http: null,
   preferThumbnail: false,
+  previewCache: null,
+  _previewRequests: new Map(),
 
   /**
    * Initialize HTTP client and set up proxy route
@@ -100,6 +106,27 @@ const immichApi = {
   init: async function (config, expressApp, force) {
     if (this.http === null || force) {
       this.preferThumbnail = !!config.preferThumbnail;
+      const cacheConfig = config.cache || {};
+      if (cacheConfig.enabled) {
+        const directory = cacheConfig.directory || path.join(os.homedir(), '.cache', 'MMM-ImmichTileSlideShow');
+        if (
+          !this.previewCache ||
+          this.previewCache.directory !== path.resolve(directory) ||
+          this.previewCache.maxBytes !== cacheConfig.maxBytes ||
+          this.previewCache.concurrency !== cacheConfig.concurrency
+        ) {
+          this.previewCache = new PreviewCache({
+            directory,
+            maxBytes: cacheConfig.maxBytes,
+            concurrency: cacheConfig.concurrency,
+            logger: Log
+          });
+        }
+        await this.previewCache.initialize();
+      } else {
+        this.previewCache = null;
+      }
+
       this.http = axios.create({
         baseURL: config.url + this.apiBaseUrl,
         timeout: config.timeout || 6000,
@@ -155,10 +182,47 @@ const immichApi = {
         if (this.debugOn) Log.info(LOG_PREFIX + '[debug] setting up image route at ' + IMMICH_PROXY_URL);
         expressApp.get(IMMICH_PROXY_URL + ':id', async (req, res) => {
           const imageId = req.params.id;
+          const version = typeof req.query.v === 'string' ? req.query.v : '';
+          const hasVariant = req.query.r === 'thumbnail' || req.query.r === 'preview';
+          const variant = req.query.r === 'thumbnail' || (!hasVariant && this.preferThumbnail)
+            ? 'thumbnail'
+            : 'preview';
+          if (this.previewCache) {
+            try {
+              const cached = await this._prefetchPreview(imageId, version, variant);
+              if (cached) {
+                const etag = cached.etag || `"${cached.key}"`;
+                res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+                res.setHeader('Content-Type', cached.contentType);
+                res.setHeader('ETag', etag);
+                const requestTags = String(req.headers['if-none-match'] || '').split(',').map((tag) => tag.trim());
+                if (requestTags.includes('*') || requestTags.includes(etag)) {
+                  res.status(304).end();
+                  return;
+                }
+
+                res.setHeader('Content-Length', String(cached.size));
+                const imageStream = fs.createReadStream(cached.filePath);
+                imageStream.on('error', (error) => {
+                  Log.warn(LOG_PREFIX + 'cached image read failed: ' + error.message);
+                  if (!res.headersSent) {
+                    res.removeHeader('Content-Length');
+                    res.status(500).end();
+                  }
+                  else res.end();
+                });
+                imageStream.pipe(res);
+                return;
+              }
+            } catch (error) {
+              Log.warn(LOG_PREFIX + 'preview cache request failed: ' + error.message);
+            }
+          }
+
           const urls = [];
           const conf = this.apiUrls[this.apiLevel];
-          // Order of preference for images: when preferThumbnail=true, try smaller thumbnail first
-          if (this.preferThumbnail) {
+          const preferThumbnail = variant === 'thumbnail';
+          if (preferThumbnail) {
             if (conf.assetDownload) urls.push(conf.assetDownload.replace('{id}', imageId));
             if (conf.assetPreview) urls.push(conf.assetPreview.replace('{id}', imageId));
           } else {
@@ -494,8 +558,95 @@ const immichApi = {
     return base64Image;
   },
 
-  getImageLink: function (imageId) {
-    return IMMICH_PROXY_URL + imageId;
+  async _prefetchPreview(assetId, version, variant) {
+    if (!this.previewCache) return null;
+    const cache = this.previewCache;
+    const cached = await cache.get(assetId, version, variant);
+    if (cached) return cached;
+
+    const key = cache.key(assetId, version, variant);
+    const existingRequest = this._previewRequests.get(key);
+    if (existingRequest) return existingRequest;
+
+    const request = cache.runLimited(async () => {
+      const secondCheck = await cache.get(assetId, version, variant);
+      if (secondCheck) return secondCheck;
+
+      const conf = this.apiUrls[this.apiLevel];
+      const urls = [];
+      if (variant === 'thumbnail') {
+        if (conf.assetDownload) urls.push(conf.assetDownload.replace('{id}', assetId));
+        if (conf.assetPreview) urls.push(conf.assetPreview.replace('{id}', assetId));
+      } else {
+        if (conf.assetPreview) urls.push(conf.assetPreview.replace('{id}', assetId));
+        if (conf.assetDownload) urls.push(conf.assetDownload.replace('{id}', assetId));
+      }
+
+      for (let index = 0; index < urls.length; index++) {
+        try {
+          const upstream = await this.http.get(urls[index], {
+            responseType: 'stream',
+            headers: { Accept: 'image/*, application/octet-stream;q=0.8' }
+          });
+          if (upstream.status >= 200 && upstream.status < 300) {
+            return await cache.store(assetId, version, variant, upstream.data, {
+              contentType: upstream.headers['content-type'] || 'image/jpeg',
+              etag: upstream.headers.etag,
+              contentLength: upstream.headers['content-length']
+            });
+          }
+
+          if (upstream.data && typeof upstream.data.destroy === 'function') upstream.data.destroy();
+          if (upstream.status !== 404 && upstream.status !== 410 && this.debugOn) {
+            Log.warn(LOG_PREFIX + `preview request returned ${upstream.status} for asset ${assetId}`);
+          }
+        } catch (error) {
+          if (index === urls.length - 1) {
+            Log.warn(LOG_PREFIX + `preview prefetch failed for asset ${assetId}: ${error.message}`);
+          }
+        }
+      }
+      return null;
+    });
+
+    this._previewRequests.set(key, request);
+    try {
+      return await request;
+    } finally {
+      if (this._previewRequests.get(key) === request) this._previewRequests.delete(key);
+    }
+  },
+
+  prefetchTiles: async function (tiles) {
+    const images = (tiles || []).filter((tile) => tile && tile.kind !== 'video' && tile.assetId);
+    if (!this.previewCache || !images.length) return { requested: images.length, cached: 0, failed: 0 };
+
+    this.previewCache.addProtectedAssets(images);
+    let nextIndex = 0;
+    let cached = 0;
+    let failed = 0;
+    const worker = async () => {
+      while (nextIndex < images.length) {
+        const tile = images[nextIndex++];
+        try {
+          if (await this._prefetchPreview(tile.assetId, tile.assetVersion, tile.cacheVariant)) cached += 1;
+          else failed += 1;
+        } catch (error) {
+          failed += 1;
+          if (this.debugOn) Log.warn(LOG_PREFIX + `preview cache failed for asset ${tile.assetId}: ${error.message}`);
+        }
+      }
+    };
+
+    const workerCount = Math.min(this.previewCache.concurrency, images.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return { requested: images.length, cached, failed };
+  },
+
+  getImageLink: function (imageId, version) {
+    const variant = this.preferThumbnail ? 'thumbnail' : 'preview';
+    const query = `?v=${encodeURIComponent(version || '')}&r=${variant}`;
+    return IMMICH_PROXY_URL + imageId + query;
   },
 
   getVideoLink: function (imageId) {

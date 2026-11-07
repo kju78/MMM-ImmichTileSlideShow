@@ -31,6 +31,9 @@ function dlog(ctx, ...args) {
  * @property {string} [posterSrc]
  * @property {string} [takenAt]
  * @property {string} [albumName]
+ * @property {string} [assetId]
+ * @property {string} [assetVersion]
+ * @property {"preview"|"thumbnail"} [cacheVariant]
  * @property {number} [w]
  * @property {number} [h]
  */
@@ -40,6 +43,8 @@ module.exports = NodeHelper.create({
 
   start() {
     this.config = null;
+    this._albumRotationTimer = null;
+    this._albumRotationState = null;
     Log.info(LOG_PREFIX + "started");
     try {
       // Ensure a PNG screenshot exists for README reference (generated locally)
@@ -51,6 +56,10 @@ module.exports = NodeHelper.create({
     }
   },
 
+  stop() {
+    _stopAlbumRotation(this);
+  },
+
   /**
    * Handle socket notifications from the front-end
    * @param {string} notification
@@ -58,8 +67,9 @@ module.exports = NodeHelper.create({
    */
   socketNotificationReceived(notification, payload) {
     if (notification === "IMMICH_TILES_REGISTER") {
-      // The frontend sends an already-normalized v2 config (configSchema.js),
-      // so no defaulting or legacy handling is needed here.
+     _stopAlbumRotation(this);
+     // The frontend sends an already-normalized v2 config (configSchema.js),
+     // so no defaulting or legacy handling is needed here.
       this.config = payload && payload.config ? payload.config : {};
       Log.info(LOG_PREFIX + "register received");
       const immichCfg = activeImmich(this.config) || {};
@@ -73,9 +83,20 @@ module.exports = NodeHelper.create({
         size: immichCfg.size
       });
       if (activeImmich(this.config)) {
-        _loadFromImmichImpl(this).catch((e) => {
-          Log.error(LOG_PREFIX + "Immich load failed: " + e.message);
-          this._sendInitialImages();
+        const rotation = this.config.albumRotation || {};
+        const load = rotation.enabled && immichCfg.source === 'album'
+          ? _startAlbumRotation(this)
+          : _loadFromImmichImpl(this);
+        load.catch((e) => {
+          Log.error(LOG_PREFIX + 'Immich load failed: ' + e.message);
+          if (rotation.enabled && immichCfg.source === 'album') {
+            _loadFromImmichImpl(this).catch((fallbackError) => {
+              Log.error(LOG_PREFIX + 'Immich fallback load failed: ' + fallbackError.message);
+              this._sendInitialImages();
+            });
+          } else {
+            this._sendInitialImages();
+          }
         });
       } else {
         this._sendInitialImages();
@@ -138,6 +159,8 @@ function toTileImage(img, immichApi, isVideo) {
   const title = (img.originalFileName || '').replace(/\.[^.]+$/, '');
   const takenAt = (img.exifInfo && img.exifInfo.dateTimeOriginal) || img.fileCreatedAt || img.fileModifiedAt || null;
   const albumName = img.albumName || null;
+  const assetVersion = String(img.updatedAt || img.fileModifiedAt || img.fileCreatedAt || img.id || '');
+  const cacheVariant = immichApi.preferThumbnail ? 'thumbnail' : 'preview';
   // Try to extract dimensions when available to avoid extra probing in the browser
   const exif = img && img.exifInfo ? img.exifInfo : {};
   const w = Number(
@@ -152,15 +175,29 @@ function toTileImage(img, immichApi, isVideo) {
     return {
       kind: 'video',
       src: immichApi.getVideoLink(img.id),
-      posterSrc: immichApi.getImageLink(img.id),
+      posterSrc: immichApi.getImageLink(img.id, assetVersion),
       title,
       takenAt,
       albumName,
+      assetId: img.id,
+      assetVersion,
+      cacheVariant,
       w,
       h
     };
   }
-  return { kind: 'image', src: immichApi.getImageLink(img.id), title, takenAt, albumName, w, h };
+  return {
+    kind: 'image',
+    src: immichApi.getImageLink(img.id, assetVersion),
+    title,
+    takenAt,
+    albumName,
+    assetId: img.id,
+    assetVersion,
+    cacheVariant,
+    w,
+    h
+  };
 }
 
 /**
@@ -205,17 +242,211 @@ function shuffle(list) {
   return list;
 }
 
+function sortTiles(tiles, cfg) {
+  switch (cfg.sort) {
+    case 'name':
+      sortByKey(tiles, 'title');
+      break;
+    case 'created':
+    case 'modified':
+    case 'taken':
+      sortByKey(tiles, 'takenAt');
+      break;
+    case 'random':
+      shuffle(tiles);
+      break;
+    case 'none':
+    default:
+      break;
+  }
+  if (cfg.sortDesc === true) tiles.reverse();
+  return tiles;
+}
+
+async function _initializeImmich(context, cfg, force) {
+  const immichApi = require('./immichApi.js');
+  immichApi.debugOn = !!(context.config && context.config.debug);
+  const perf = (context.config && context.config.performance) || {};
+  await immichApi.init({
+    ...cfg,
+    preferThumbnail: !!perf.lightweight,
+    cache: context.config && context.config.cache
+  }, context.expressApp, force);
+  dlog(context, 'api level resolved', immichApi.apiLevel);
+  return immichApi;
+}
+
+function _stopAlbumRotation(context) {
+  if (context._albumRotationTimer) clearTimeout(context._albumRotationTimer);
+  context._albumRotationTimer = null;
+  context._albumRotationState = null;
+}
+
+async function _resolveRotationAlbums(context, cfg, immichApi) {
+  const albumMap = await immichApi.getAlbumNameToIdMap();
+  const byId = new Map(Array.from(albumMap.entries()).map(([name, id]) => [String(id), name]));
+  const rotation = context.config.albumRotation || {};
+  const candidates = [];
+  const seenIds = new Set();
+  const addAlbum = (id, name) => {
+    if (!id || seenIds.has(String(id))) return;
+    seenIds.add(String(id));
+    candidates.push({ id: String(id), name: name || byId.get(String(id)) || String(id) });
+  };
+
+  for (const selector of rotation.albums || []) {
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(selector)) {
+      const id = selector.toLowerCase();
+      addAlbum(id, byId.get(id));
+    } else if (albumMap.has(selector)) {
+      addAlbum(albumMap.get(selector), selector);
+    } else {
+      Log.warn(LOG_PREFIX + `albumRotation album not found: ${selector}`);
+    }
+  }
+
+  for (const definition of rotation.patterns || []) {
+    const pattern = new RegExp(definition.source, definition.flags);
+    for (const [name, id] of albumMap.entries()) {
+      pattern.lastIndex = 0;
+      if (pattern.test(name)) addAlbum(id, name);
+    }
+  }
+
+  if (!(rotation.albums || []).length && !(rotation.patterns || []).length) {
+    for (const name of cfg.albumNames || []) {
+      if (albumMap.has(name)) addAlbum(albumMap.get(name), name);
+    }
+    for (const id of cfg.albumIds || []) addAlbum(id, byId.get(String(id)));
+  }
+
+  if (!candidates.length) {
+    throw new Error('albumRotation selected no albums; check its names and regular-expression patterns.');
+  }
+  return candidates;
+}
+
+function _scheduleAlbumRotation(context, delay) {
+  if (context._albumRotationTimer) clearTimeout(context._albumRotationTimer);
+  context._albumRotationTimer = setTimeout(() => {
+    _rotateAlbum(context).catch((error) => {
+      Log.error(LOG_PREFIX + 'album rotation failed: ' + error.message);
+      _scheduleAlbumRotation(context, 5 * 60 * 1000);
+    });
+  }, delay);
+}
+
+async function _prepareNextAlbum(context) {
+  const state = context._albumRotationState;
+  if (!state || state.stage || state.preparing) return state && state.preparing;
+  const nextIndex = (state.currentIndex + 1) % state.candidates.length;
+  const album = state.candidates[nextIndex];
+
+  state.preparing = (async () => {
+    const tiles = await _loadFromImmichImpl(context, {
+      album,
+      emit: false,
+      keepCachePins: true,
+      waitForCache: true,
+      skipInit: true
+    });
+    if (!tiles.length) throw new Error(`album "${album.name}" returned no supported media.`);
+    state.stage = { index: nextIndex, album, tiles };
+    Log.info(LOG_PREFIX + `Next album prepared (${tiles.length} tile(s)).`);
+  })();
+
+  try {
+    await state.preparing;
+  } finally {
+    state.preparing = null;
+  }
+}
+
+async function _rotateAlbum(context) {
+  const state = context._albumRotationState;
+  if (!state) return;
+  if (!state.stage) {
+    Log.warn(LOG_PREFIX + 'Next album is not ready; keeping the current album and retrying shortly.');
+    _prepareNextAlbum(context).catch((error) => {
+      Log.error(LOG_PREFIX + 'Could not prepare next album: ' + error.message);
+    });
+    _scheduleAlbumRotation(context, 5 * 60 * 1000);
+    return;
+  }
+
+  const next = state.stage;
+  state.currentIndex = next.index;
+  state.currentTiles = next.tiles;
+  state.stage = null;
+  const immichApi = require('./immichApi.js');
+  if (immichApi.previewCache) immichApi.previewCache.setProtectedAssets(state.currentTiles);
+  context.sendSocketNotification('IMMICH_TILES_DATA', { images: state.currentTiles });
+  Log.info(LOG_PREFIX + `Switched to album ${next.index + 1}/${state.candidates.length}.`);
+
+  _prepareNextAlbum(context).catch((error) => {
+    Log.error(LOG_PREFIX + 'Could not prepare next album: ' + error.message);
+  });
+  _scheduleAlbumRotation(context, state.intervalMs);
+}
+
+async function _startAlbumRotation(context) {
+  const cfg = activeImmich(context.config);
+  const immichApi = await _initializeImmich(context, cfg, true);
+  if (immichApi.previewCache) immichApi.previewCache.setProtectedAssets([]);
+
+  const candidates = await _resolveRotationAlbums(context, cfg, immichApi);
+  const configuredIds = new Set((cfg.albumIds || []).map((id) => id.toLowerCase()));
+  const currentIndex = Math.max(0, candidates.findIndex((album) =>
+    configuredIds.has(album.id.toLowerCase()) || (cfg.albumNames || []).includes(album.name)
+  ));
+  if (candidates.length < 2) {
+    Log.info(LOG_PREFIX + 'Album rotation matched fewer than two albums; loading the selected album without rotation.');
+    await _loadFromImmichImpl(context, {
+      album: candidates[currentIndex],
+      keepCachePins: true,
+      skipInit: true
+    });
+    return;
+  }
+
+  const state = {
+    candidates,
+    currentIndex,
+    currentTiles: [],
+    stage: null,
+    preparing: null,
+    intervalMs: context.config.albumRotation.intervalMinutes * 60 * 1000
+  };
+  Log.info(LOG_PREFIX + `Album rotation selected ${candidates.length} album(s); interval is ${context.config.albumRotation.intervalMinutes} minute(s).`);
+  context._albumRotationState = state;
+  state.currentTiles = await _loadFromImmichImpl(context, {
+    album: candidates[currentIndex],
+    keepCachePins: true,
+    skipInit: true
+  });
+  if (immichApi.previewCache) immichApi.previewCache.setProtectedAssets(state.currentTiles);
+
+  _prepareNextAlbum(context).catch((error) => {
+    Log.error(LOG_PREFIX + 'Could not prepare next album: ' + error.message);
+  });
+  _scheduleAlbumRotation(context, state.intervalMs);
+}
+
 /**
  * Fetch images from Immich and send to client
  */
-async function _loadFromImmichImpl(context) {
+async function _loadFromImmichImpl(context, options) {
+  options = options || {};
   // Lazy-require the API dep only when needed
   const immichApi = require('./immichApi.js');
-  const cfg = activeImmich(context.config);
+  let cfg = activeImmich(context.config);
   if (!cfg) {
     Log.error(LOG_PREFIX + 'No usable Immich server configured (needs `url` and `apiKey`).');
     context._sendInitialImages();
     return;
+  }
+  if (options.album) {
+    cfg = { ...cfg, albumIds: [options.album.id], albumNames: [] };
   }
   dlog(context, 'active immich server', {
     source: cfg.source,
@@ -230,12 +461,8 @@ async function _loadFromImmichImpl(context) {
   const validImageSet = new Set(context.config.imageExtensions || []);
   const validVideoSet = new Set(context.config.videoExtensions || []);
 
-  // toggle immichApi debug passthrough
-  immichApi.debugOn = !!(context.config && context.config.debug);
-  // Prefer thumbnail-sized assets in lightweight mode; fallback to original
-  const perf = (context.config && context.config.performance) || {};
-  await immichApi.init({ ...cfg, preferThumbnail: !!perf.lightweight }, context.expressApp, true);
-  dlog(context, 'api level resolved', immichApi.apiLevel);
+  if (!options.skipInit) await _initializeImmich(context, cfg, true);
+  if (immichApi.previewCache && !options.keepCachePins) immichApi.previewCache.setProtectedAssets([]);
 
   let images = [];
   if (cfg.source === 'album') {
@@ -255,15 +482,22 @@ async function _loadFromImmichImpl(context) {
       const needsFinalSort = sortMode === 'name' || sortMode === 'created' || sortMode === 'modified' || sortMode === 'taken';
       let firstPageSent = false;
       const appendedRaw = [];
+      const progressiveTiles = [];
+      const prefetchTasks = [];
 
       const onPage = (items) => {
         appendedRaw.push(...items);
-        // For sort modes that require the full pool (by name/date), defer emission
-        // until all pages are collected; emit once at the end after sort/reverse.
-        if (needsFinalSort) return;
         const pageTiles = _filterAndMap(items, immichApi, context, validImageSet, validVideoSet);
         if (!pageTiles.length) return;
-        if (sortMode === 'random') shuffle(pageTiles);
+        if (sortMode === 'random' && !needsFinalSort) shuffle(pageTiles);
+        progressiveTiles.push(...pageTiles);
+        if (immichApi.previewCache) {
+          prefetchTasks.push(immichApi.prefetchTiles(pageTiles).catch((error) => {
+            Log.warn(LOG_PREFIX + 'Could not prefetch album previews: ' + error.message);
+            return null;
+          }));
+        }
+        if (options.emit === false || needsFinalSort) return;
         if (!firstPageSent) {
           firstPageSent = true;
           Log.info(LOG_PREFIX + `First page ready — sending ${pageTiles.length} tile(s) to frontend`);
@@ -277,14 +511,16 @@ async function _loadFromImmichImpl(context) {
       images = await immichApi.getAlbumAssetsForAlbumIds(albumIds, { onPage });
       dlog(context, 'album assets total', images && images.length);
 
+      if (options.waitForCache) await Promise.all(prefetchTasks);
+      if (options.emit === false) return sortTiles(progressiveTiles, cfg);
+
       if (needsFinalSort) {
         // Single terminal emission for date/name sorts — the frontend receives
         // one fully-sorted set (same UX as before, just after paging completes).
         // Fall through to the shared sort/emit path below.
       } else {
-        // Already emitted progressively; suppress the terminal emission by using
-        // the raw appended set for the tail-end no-op path.
-        return; // done — nothing more to do for progressive modes
+        // Pages were already emitted; do not send the same media a second time.
+        return progressiveTiles;
       }
       // For final-sort modes, hand off to the shared path with the accumulated set.
       images = appendedRaw;
@@ -350,33 +586,24 @@ async function _loadFromImmichImpl(context) {
     return toTileImage(img, immichApi, isVideo);
   });
   dlog(context, 'mapped tiles', tiles && tiles.length);
+  if (cfg.source !== 'album' && immichApi.previewCache) {
+    const prefetch = immichApi.prefetchTiles(tiles);
+    if (options.waitForCache) await prefetch;
+    else prefetch.catch((error) => Log.warn(LOG_PREFIX + 'Could not prefetch media previews: ' + error.message));
+  }
 
   // No server-side pool cap; all filtered media are returned.
 
   // Sort
-  switch (cfg.sort) {
-    case 'name':
-      tiles = sortByKey(tiles, 'title');
-      break;
-    case 'created':
-    case 'modified':
-    case 'taken':
-      tiles = sortByKey(tiles, 'takenAt');
-      break;
-    case 'random':
-      tiles = shuffle(tiles);
-      break;
-    case 'none':
-    default:
-      // keep API order
-      break;
-  }
-  if (cfg.sortDesc === true) tiles.reverse();
+  tiles = sortTiles(tiles, cfg);
   dlog(context, 'sorted tiles', cfg.sort, 'descending?', cfg.sortDesc, 'count', tiles && tiles.length);
+
+  if (options.emit === false) return tiles;
 
   // Send to client
   Log.info(LOG_PREFIX + `Loaded ${tiles.length} image(s) for source=${cfg.source}`);
   context.sendSocketNotification('IMMICH_TILES_DATA', { images: tiles });
+  return tiles;
 }
 
 // Bind to the module object

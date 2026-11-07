@@ -34,7 +34,7 @@ Pick a **mode**, point it at your Immich server, done:
 
 ```bash
 cd ~/MagicMirror/modules
-git clone https://github.com/enarciso/MMM-ImmichTileSlideShow.git MMM-ImmichTileSlideShow
+git clone https://github.com/kju78/MMM-ImmichTileSlideShow.git MMM-ImmichTileSlideShow
 cd MMM-ImmichTileSlideShow
 npm install
 ```
@@ -230,6 +230,55 @@ Grouped options accept `true`, `false`, **or** an object of settings — so `vid
 | `sortDesc` | boolean | `false` | Reverse the sort order. |
 | `activeImmich` | number | `0` | Top-level: which server in the `immich` array to use. |
 
+### Local preview cache and album rotation
+
+The optional server-side cache stores Immich previews on local disk. It is
+disabled by default; videos continue to stream from Immich, while video posters
+use the image cache.
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `cache` | boolean \| object | `false` | Enable the local preview cache. |
+| `cache.directory` | string | `~/.cache/MMM-ImmichTileSlideShow` | Cache directory; set an absolute path on a mounted USB drive to move it off the SD card. |
+| `cache.maxBytes` | number | `8589934592` | Maximum cache size (8 GiB). The oldest unprotected previews are evicted first. |
+| `cache.concurrency` | number | `2` | Maximum number of preview downloads in flight; valid range is 1–8. |
+| `albumRotation` | boolean \| object | `false` | Rotate through selected albums while preparing the next album in the background. |
+| `albumRotation.intervalMinutes` | number | `60` | Time to show each album. If preparation is late, the current album remains visible and the helper retries every five minutes. |
+| `albumRotation.albums` | array \| string | `[]` | Exact album names or IDs to include. |
+| `albumRotation.patterns` | array \| RegExp | `[]` | Regular-expression source strings or RegExp values matched against album names. Exact names and patterns are combined. |
+
+If both album selectors are empty, rotation uses the album names and IDs from
+`immich.album`. The current album from `immich.album` is used as the starting
+album when it matches the selection. Rotation only accepts `source: "album"`.
+
+The active and next albums are protected from eviction while the next album is
+being prepared. When the configured size limit prevents storing a preview, that
+image still loads through the normal Immich proxy. A cache directory on a USB
+SSD can be selected with an absolute path after the drive is mounted.
+
+```js
+config: {
+  cache: {
+    enabled: true,
+    directory: "/mnt/usb/immich-preview-cache",
+    maxBytes: 8 * 1024 * 1024 * 1024,
+    concurrency: 2
+  },
+  albumRotation: {
+    enabled: true,
+    intervalMinutes: 60,
+    albums: [],
+    patterns: ["^\\d{4}( [^-].*)?$"]
+  },
+  immich: {
+    url: "http://your-immich-host:2283",
+    apiKey: "<YOUR_API_KEY>",
+    source: "album",
+    album: "Current album"
+  }
+}
+```
+
 ## Immich integration
 
 The module detects your Immich version and picks the right endpoints, then proxies media through MagicMirror so no credentials reach the browser.
@@ -237,7 +286,7 @@ The module detects your Immich version and picks the right endpoints, then proxi
 - **Images** — proxied Immich thumbnails. With `performance.lightweight`, the smaller `thumbnail` is tried first, then `preview`, then the original. Otherwise `preview` first.
 - **Videos** — the encoded video stream (v1.x `/assets/{id}/video`, v3+ `/assets/{id}/video/playback`) with a thumbnail poster.
 - **Large albums** — on Immich v3+, album assets are paged via `/search/metadata` and stream to the browser as they arrive, so a 6,000-photo album starts rendering after the first page instead of blocking.
-- **Caching** — the proxy preserves ETag / If-Modified-Since so the browser can reuse cached media.
+- **Local caching** — optional preview caching is keyed by asset version and rendition, so unchanged previews can be served without another NAS request. The active album is shown immediately; the next selected album is loaded and cached before the scheduled switch.
 
 ### Required API-key permissions
 
@@ -252,6 +301,11 @@ When creating the key in Immich (**Account → API Keys**), grant:
 | `memory.read` | `source: "memory"` |
 
 On pre-v3 servers `asset.read` also covers thumbnails and originals — the `asset.view` / `asset.download` split arrived in v3.
+
+## Tests
+
+Run the built-in tests with `npm test`. They cover cache persistence, size limits,
+protected assets, and cache/rotation configuration validation.
 
 ## Migrating from v1
 

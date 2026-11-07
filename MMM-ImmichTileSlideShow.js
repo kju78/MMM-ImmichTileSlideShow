@@ -69,6 +69,10 @@ Module.register("MMM-ImmichTileSlideShow", {
       sizeCacheTtlMinutes: 30
     },
 
+    // Server-side preview cache and optional hourly album rotation
+    cache: false,
+    albumRotation: false,
+
     // Immich: one object, or an array of servers
     immich: null,
     activeImmich: 0,

@@ -19,14 +19,15 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/enarciso/MMM-ImmichTileSlideShow.git"
+    "url": "https://github.com/kju78/MMM-ImmichTileSlideShow.git"
   },
   "bugs": {
-    "url": "https://github.com/enarciso/MMM-ImmichTileSlideShow/issues"
+    "url": "https://github.com/kju78/MMM-ImmichTileSlideShow/issues"
   },
-  "homepage": "https://github.com/enarciso/MMM-ImmichTileSlideShow#readme",
+  "homepage": "https://github.com/kju78/MMM-ImmichTileSlideShow#readme",
   "scripts": {
     "lint": "eslint . || true",
+    "test": "node --test",
     "postinstall": "echo 'MMM-ImmichTileSlideShow ready'"
   },
   "dependencies": {

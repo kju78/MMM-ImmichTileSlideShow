@@ -174,6 +174,34 @@
     return src.toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
   }
 
+  function stringList(value, optionName) {
+    if (value == null) return [];
+    const items = Array.isArray(value) ? value : [value];
+    return items.map((item, index) => {
+      if (typeof item !== 'string' || !item.trim()) {
+        throw new Error(`${optionName}[${index}] must be a non-empty string.`);
+      }
+      return item.trim();
+    });
+  }
+
+  function patternList(value) {
+    if (value == null) return [];
+    const items = Array.isArray(value) ? value : [value];
+    return items.map((item, index) => {
+      const pattern = item instanceof RegExp
+        ? { source: item.source, flags: item.flags }
+        : { source: typeof item === 'string' ? item.trim() : '', flags: '' };
+      if (!pattern.source) throw new Error(`albumRotation.patterns[${index}] must be a non-empty regular expression.`);
+      try {
+        new RegExp(pattern.source, pattern.flags);
+      } catch (error) {
+        throw new Error(`albumRotation.patterns[${index}] is invalid: ${error.message}`);
+      }
+      return pattern;
+    });
+  }
+
   /**
    * Normalize one Immich server entry.
    */
@@ -299,6 +327,36 @@
     const immich = immichRaw.map(normalizeImmich);
     const activeImmich = Math.max(0, Math.min(immich.length - 1, Number(raw.activeImmich) || 0));
 
+    const cache = group(raw.cache, {
+      directory: null,
+      maxBytes: 8 * 1024 * 1024 * 1024,
+      concurrency: 2
+    }, false);
+    cache.directory = typeof cache.directory === 'string' && cache.directory.trim() ? cache.directory.trim() : null;
+    cache.maxBytes = Number(cache.maxBytes);
+    if (!Number.isSafeInteger(cache.maxBytes) || cache.maxBytes <= 0) {
+      throw new Error('cache.maxBytes must be a positive safe integer.');
+    }
+    cache.concurrency = Number(cache.concurrency);
+    if (!Number.isInteger(cache.concurrency) || cache.concurrency < 1 || cache.concurrency > 8) {
+      throw new Error('cache.concurrency must be an integer from 1 to 8.');
+    }
+
+    const albumRotation = group(raw.albumRotation, {
+      intervalMinutes: 60,
+      albums: [],
+      patterns: []
+    }, false);
+    albumRotation.intervalMinutes = Number(albumRotation.intervalMinutes);
+    if (!Number.isFinite(albumRotation.intervalMinutes) || albumRotation.intervalMinutes < 1) {
+      throw new Error('albumRotation.intervalMinutes must be at least 1.');
+    }
+    albumRotation.albums = stringList(albumRotation.albums, 'albumRotation.albums');
+    albumRotation.patterns = patternList(albumRotation.patterns);
+    if (albumRotation.enabled && (!immich[activeImmich] || immich[activeImmich].source !== 'album')) {
+      throw new Error('albumRotation requires the active Immich source to be "album".');
+    }
+
     return {
       mode,
       layout,
@@ -307,6 +365,8 @@
       scroll,
       captions,
       performance,
+      cache,
+      albumRotation,
       immich,
       activeImmich,
 
