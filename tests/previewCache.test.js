@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { mkdtemp, readFile, rm } = require('node:fs/promises');
+const { mkdtemp, readFile, readdir, rm } = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { Readable } = require('node:stream');
@@ -74,4 +74,35 @@ test('skips a preview whose declared size exceeds the entire cache limit', async
 
   assert.equal(result, null);
   assert.equal(cache.totalBytes, 0);
+});
+
+test('bounds unknown-length media streams and restores custom data-file extensions', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'mmm-immich-video-cache-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const options = {
+    directory,
+    maxBytes: 8,
+    maxEntryBytes: 4,
+    concurrency: 1,
+    fileExtension: 'bin',
+    label: 'Video cache'
+  };
+  const cache = new PreviewCache(options);
+  await cache.initialize();
+
+  const oversized = await cache.store('video-large', '1', 'video', imageStream('12345'), {
+    contentType: 'video/mp4'
+  });
+  assert.equal(oversized, null);
+  assert.equal(cache.totalBytes, 0);
+  assert.equal((await readdir(directory)).some((filename) => filename.includes('.tmp-')), false);
+
+  const stored = await cache.store('video-small', '1', 'video', imageStream('1234'), {
+    contentType: 'video/mp4'
+  });
+  assert.ok(stored.filePath.endsWith('.bin'));
+
+  const restored = new PreviewCache(options);
+  await restored.initialize();
+  assert.equal((await restored.get('video-small', '1', 'video')).size, 4);
 });

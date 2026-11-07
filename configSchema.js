@@ -341,12 +341,17 @@
     const cache = group(raw.cache, {
       directory: null,
       maxBytes: 8 * 1024 * 1024 * 1024,
+      videoMaxBytes: 0,
       concurrency: 2
     }, false);
     cache.directory = typeof cache.directory === 'string' && cache.directory.trim() ? cache.directory.trim() : null;
     cache.maxBytes = Number(cache.maxBytes);
     if (!Number.isSafeInteger(cache.maxBytes) || cache.maxBytes <= 0) {
       throw new Error('cache.maxBytes must be a positive safe integer.');
+    }
+    cache.videoMaxBytes = Number(cache.videoMaxBytes);
+    if (!Number.isSafeInteger(cache.videoMaxBytes) || cache.videoMaxBytes < 0) {
+      throw new Error('cache.videoMaxBytes must be a non-negative safe integer.');
     }
     cache.concurrency = Number(cache.concurrency);
     if (!Number.isInteger(cache.concurrency) || cache.concurrency < 1 || cache.concurrency > 8) {

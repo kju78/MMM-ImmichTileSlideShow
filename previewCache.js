@@ -20,6 +20,15 @@ class PreviewCache {
     if (!Number.isSafeInteger(this.maxBytes) || this.maxBytes <= 0) {
       throw new Error('Preview cache maxBytes must be a positive safe integer.');
     }
+    this.maxEntryBytes = Number(options.maxEntryBytes == null ? this.maxBytes : options.maxEntryBytes);
+    if (!Number.isSafeInteger(this.maxEntryBytes) || this.maxEntryBytes <= 0) {
+      throw new Error('Cache maxEntryBytes must be a positive safe integer.');
+    }
+    this.fileExtension = String(options.fileExtension || 'img').toLowerCase();
+    if (!/^[a-z0-9]+$/.test(this.fileExtension)) {
+      throw new Error('Cache fileExtension must contain only letters and numbers.');
+    }
+    this.label = options.label || 'Preview cache';
 
     this.logger = options.logger || null;
     this.entries = new Map();
@@ -56,7 +65,8 @@ class PreviewCache {
     const files = await fsp.readdir(this.directory);
     this.entries.clear();
     this.totalBytes = 0;
-    const knownImages = new Set();
+    const knownDataFiles = new Set();
+    const dataFilenamePattern = new RegExp(`^[a-f0-9]{64}\\.${this.fileExtension}$`, 'i');
     const metadataFiles = files.filter((filename) => /^[a-f0-9]{64}\.json$/i.test(filename));
     let nextMetadataIndex = 0;
     const loadWorker = async () => {
@@ -64,12 +74,12 @@ class PreviewCache {
         const filename = metadataFiles[nextMetadataIndex++];
         const key = filename.slice(0, -5);
         const metadataPath = path.join(this.directory, filename);
-        const imagePath = this._imagePath(key);
+        const dataPath = this._dataPath(key);
         try {
           const metadata = JSON.parse(await fsp.readFile(metadataPath, 'utf8'));
-          const stat = await fsp.stat(imagePath);
+          const stat = await fsp.stat(dataPath);
           if (metadata.key !== key || !stat.isFile()) {
-            throw new Error('cache metadata does not match its image file');
+            throw new Error('cache metadata does not match its data file');
           }
 
           const entry = {
@@ -84,11 +94,11 @@ class PreviewCache {
           };
           this.entries.set(key, entry);
           this.totalBytes += stat.size;
-          knownImages.add(`${key}.img`);
+          knownDataFiles.add(`${key}.${this.fileExtension}`);
         } catch (error) {
           this._log('warn', `Ignoring invalid cache entry ${key}: ${error.message}`);
           await this._unlinkIfPresent(metadataPath);
-          await this._unlinkIfPresent(imagePath);
+          await this._unlinkIfPresent(dataPath);
         }
       }
     };
@@ -96,7 +106,7 @@ class PreviewCache {
     await Promise.all(Array.from({ length: loadConcurrency }, () => loadWorker()));
 
     for (const filename of files) {
-      if (/^[a-f0-9]{64}\.img$/i.test(filename) && !knownImages.has(filename)) {
+      if (dataFilenamePattern.test(filename) && !knownDataFiles.has(filename)) {
         await this._unlinkIfPresent(path.join(this.directory, filename));
       } else if (/^[a-f0-9]{64}\.tmp-[0-9]+-[a-f0-9]+$/i.test(filename)) {
         await this._unlinkIfPresent(path.join(this.directory, filename));
@@ -107,14 +117,14 @@ class PreviewCache {
 
     await this._withWriteLock(() => this._evictFor(0));
     this.initialized = true;
-    this._log('info', `Preview cache ready at ${this.directory} (${this.totalBytes} bytes).`);
+    this._log('info', `ready at ${this.directory} (${this.totalBytes} bytes).`);
   }
 
   async get(assetId, version, variant) {
     const key = this.key(assetId, version, variant);
     const entry = this.entries.get(key);
     if (!entry) return null;
-    const filePath = this._imagePath(key);
+    const filePath = this._dataPath(key);
     try {
       await fsp.access(filePath);
     } catch (error) {
@@ -158,13 +168,14 @@ class PreviewCache {
     const existing = this.entries.get(key);
     if (existing) {
       if (source && typeof source.destroy === 'function') source.destroy();
-      return { ...existing, filePath: this._imagePath(key) };
+      return { ...existing, filePath: this._dataPath(key) };
     }
 
+    const sizeLimit = Math.min(this.maxBytes, this.maxEntryBytes);
     const expectedSize = Number(metadata && metadata.contentLength);
-    if (Number.isFinite(expectedSize) && expectedSize > this.maxBytes) {
+    if (Number.isFinite(expectedSize) && expectedSize > sizeLimit) {
       if (source && typeof source.destroy === 'function') source.destroy();
-      this._log('warn', `Preview for asset ${assetId} exceeds the cache size limit.`);
+      this._log('warn', 'Entry exceeds the configured size limit.');
       return null;
     }
 
@@ -174,6 +185,12 @@ class PreviewCache {
     const counter = new Transform({
       transform(chunk, encoding, callback) {
         size += chunk.length;
+        if (size > sizeLimit) {
+          const error = new Error('Cache entry exceeds the configured size limit.');
+          error.code = 'CACHE_ENTRY_TOO_LARGE';
+          callback(error);
+          return;
+        }
         callback(null, chunk);
       }
     });
@@ -182,6 +199,10 @@ class PreviewCache {
       await pipelineAsync(source, counter, fs.createWriteStream(tempPath, { flags: 'wx' }));
     } catch (error) {
       await this._unlinkIfPresent(tempPath);
+      if (error.code === 'CACHE_ENTRY_TOO_LARGE') {
+        this._log('warn', 'Entry exceeds the configured size limit.');
+        return null;
+      }
       throw error;
     }
 
@@ -194,12 +215,12 @@ class PreviewCache {
       const alreadyStored = this.entries.get(key);
       if (alreadyStored) {
         await this._unlinkIfPresent(tempPath);
-        return { ...alreadyStored, filePath: this._imagePath(key) };
+        return { ...alreadyStored, filePath: this._dataPath(key) };
       }
 
-      if (size > this.maxBytes) {
+      if (size > sizeLimit) {
         await this._unlinkIfPresent(tempPath);
-        this._log('warn', `Preview cache limit reached; did not store asset ${assetId}.`);
+        this._log('warn', 'Entry exceeds the configured size limit.');
         return null;
       }
       await this._evictFor(size);
@@ -209,7 +230,7 @@ class PreviewCache {
         return null;
       }
 
-      const imagePath = this._imagePath(key);
+      const dataPath = this._dataPath(key);
       const metadataPath = this._metadataPath(key);
       const createdAt = new Date().toISOString();
       const entry = {
@@ -223,25 +244,25 @@ class PreviewCache {
         createdAt
       };
 
-      await fsp.rename(tempPath, imagePath);
+      await fsp.rename(tempPath, dataPath);
       const metadataTempPath = `${metadataPath}.tmp-${token}`;
       try {
         await fsp.writeFile(metadataTempPath, JSON.stringify(entry), { flag: 'wx' });
         await fsp.rename(metadataTempPath, metadataPath);
       } catch (error) {
         await this._unlinkIfPresent(metadataTempPath);
-        await this._unlinkIfPresent(imagePath);
+        await this._unlinkIfPresent(dataPath);
         throw error;
       }
 
       this.entries.set(key, entry);
       this.totalBytes += size;
-      return { ...entry, filePath: imagePath };
+      return { ...entry, filePath: dataPath };
     });
   }
 
-  _imagePath(key) {
-    return path.join(this.directory, `${key}.img`);
+  _dataPath(key) {
+    return path.join(this.directory, `${key}.${this.fileExtension}`);
   }
 
   _metadataPath(key) {
@@ -257,7 +278,7 @@ class PreviewCache {
 
     for (const entry of oldestFirst) {
       if (this.totalBytes + incomingBytes <= this.maxBytes) break;
-      await this._unlinkIfPresent(this._imagePath(entry.key));
+      await this._unlinkIfPresent(this._dataPath(entry.key));
       await this._unlinkIfPresent(this._metadataPath(entry.key));
       this.entries.delete(entry.key);
       this.totalBytes -= entry.size;
@@ -302,7 +323,7 @@ class PreviewCache {
 
   _log(level, message) {
     if (this.logger && typeof this.logger[level] === 'function') {
-      this.logger[level](`MMM-ImmichTileSlideShow :: cache :: ${message}`);
+      this.logger[level](`MMM-ImmichTileSlideShow :: ${this.label} :: ${message}`);
     }
   }
 }

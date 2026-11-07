@@ -175,7 +175,7 @@ function toTileImage(img, immichApi, isVideo) {
   if (isVideo) {
     return {
       kind: 'video',
-      src: immichApi.getVideoLink(img.id),
+      src: immichApi.getVideoLink(img.id, assetVersion),
       posterSrc: immichApi.getImageLink(img.id, assetVersion),
       title,
       takenAt,
@@ -266,6 +266,17 @@ function sortTiles(tiles, cfg) {
   return tiles;
 }
 
+function _setCacheProtection(immichApi, tiles) {
+  const assets = Array.isArray(tiles) ? tiles : [];
+  if (immichApi.previewCache) immichApi.previewCache.setProtectedAssets(assets);
+  if (immichApi.videoCache) {
+    const videos = assets
+      .filter((tile) => tile && tile.kind === 'video')
+      .map((tile) => ({ ...tile, cacheVariant: 'video' }));
+    immichApi.videoCache.setProtectedAssets(videos);
+  }
+}
+
 async function _initializeImmich(context, cfg, force) {
   const immichApi = require('./immichApi.js');
   immichApi.debugOn = !!(context.config && context.config.debug);
@@ -273,7 +284,8 @@ async function _initializeImmich(context, cfg, force) {
   await immichApi.init({
     ...cfg,
     preferThumbnail: !!perf.lightweight,
-    cache: context.config && context.config.cache
+    cache: context.config && context.config.cache,
+    videos: context.config && context.config.videos
   }, context.expressApp, force);
   dlog(context, 'api level resolved', immichApi.apiLevel);
   return immichApi;
@@ -394,7 +406,7 @@ async function _rotateAlbum(context) {
   state.currentTiles = next.tiles;
   state.stage = null;
   const immichApi = require('./immichApi.js');
-  if (immichApi.previewCache) immichApi.previewCache.setProtectedAssets(state.currentTiles);
+  _setCacheProtection(immichApi, state.currentTiles);
   context.sendSocketNotification('IMMICH_TILES_DATA', {
     images: state.currentTiles,
     albumName: next.album.name
@@ -414,7 +426,7 @@ function _randomAlbumIndex(candidateCount) {
 async function _startAlbumRotation(context) {
   const cfg = activeImmich(context.config);
   const immichApi = await _initializeImmich(context, cfg, true);
-  if (immichApi.previewCache) immichApi.previewCache.setProtectedAssets([]);
+  _setCacheProtection(immichApi, []);
 
   const candidates = await _resolveRotationAlbums(context, cfg, immichApi);
   const currentIndex = _randomAlbumIndex(candidates.length);
@@ -447,7 +459,7 @@ async function _startAlbumRotation(context) {
     keepCachePins: true,
     skipInit: true
   });
-  if (immichApi.previewCache) immichApi.previewCache.setProtectedAssets(state.currentTiles);
+  _setCacheProtection(immichApi, state.currentTiles);
 
   _prepareNextAlbum(context).catch((error) => {
     Log.error(LOG_PREFIX + 'Could not prepare next album: ' + error.message);
@@ -494,7 +506,9 @@ async function _loadFromImmichImpl(context, options) {
     const selected = Array.from(albumMap.entries()).find(([, id]) => String(id) === String(cfg.albumIds[0]));
     if (selected) albumName = selected[0];
   }
-  if (immichApi.previewCache && !options.keepCachePins) immichApi.previewCache.setProtectedAssets([]);
+  if ((immichApi.previewCache || immichApi.videoCache) && !options.keepCachePins) {
+    _setCacheProtection(immichApi, []);
+  }
 
   let images = [];
   if (cfg.source === 'album') {
@@ -523,9 +537,9 @@ async function _loadFromImmichImpl(context, options) {
         if (!pageTiles.length) return;
         if (sortMode === 'random' && !needsFinalSort) shuffle(pageTiles);
         progressiveTiles.push(...pageTiles);
-        if (immichApi.previewCache) {
+        if (immichApi.previewCache || immichApi.videoCache) {
           prefetchTasks.push(immichApi.prefetchTiles(pageTiles).catch((error) => {
-            Log.warn(LOG_PREFIX + 'Could not prefetch album previews: ' + error.message);
+            Log.warn(LOG_PREFIX + 'Could not prefetch album media: ' + error.message);
             return null;
           }));
         }
@@ -620,10 +634,10 @@ async function _loadFromImmichImpl(context, options) {
     return tile;
   });
   dlog(context, 'mapped tiles', tiles && tiles.length);
-  if (cfg.source !== 'album' && immichApi.previewCache) {
+  if (cfg.source !== 'album' && (immichApi.previewCache || immichApi.videoCache)) {
     const prefetch = immichApi.prefetchTiles(tiles);
     if (options.waitForCache) await prefetch;
-    else prefetch.catch((error) => Log.warn(LOG_PREFIX + 'Could not prefetch media previews: ' + error.message));
+    else prefetch.catch((error) => Log.warn(LOG_PREFIX + 'Could not prefetch media: ' + error.message));
   }
 
   // No server-side pool cap; all filtered media are returned.

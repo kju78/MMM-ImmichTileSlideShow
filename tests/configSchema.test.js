@@ -20,13 +20,14 @@ const yearAndEmoji = {
 test('normalizes cache and album rotation settings, including RegExp patterns', () => {
   const config = normalize({
     immich: albumConfig,
-    cache: { enabled: true, directory: '/tmp/immich-cache', maxBytes: 2048, concurrency: 3 },
+    cache: { enabled: true, directory: '/tmp/immich-cache', maxBytes: 2048, videoMaxBytes: 1024, concurrency: 3 },
     albumRotation: { enabled: true, intervalMinutes: 60, alignToHour: true, patterns: [yearAndEmoji, /^2026/i] }
   });
 
   assert.deepEqual(config.cache, {
     directory: '/tmp/immich-cache',
     maxBytes: 2048,
+    videoMaxBytes: 1024,
     concurrency: 3,
     enabled: true
   });
@@ -66,4 +67,11 @@ test('rejects invalid rotation patterns and non-album rotation sources', () => {
     immich: { ...albumConfig, source: 'search' },
     albumRotation: true
   }), /albumRotation requires the active Immich source to be "album"/);
+});
+
+test('rejects invalid video-cache size limits', () => {
+  assert.throws(() => normalize({
+    immich: albumConfig,
+    cache: { videoMaxBytes: -1 }
+  }), /cache\.videoMaxBytes must be a non-negative safe integer/);
 });

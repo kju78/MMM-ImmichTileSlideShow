@@ -230,17 +230,18 @@ Grouped options accept `true`, `false`, **or** an object of settings — so `vid
 | `sortDesc` | boolean | `false` | Reverse the sort order. |
 | `activeImmich` | number | `0` | Top-level: which server in the `immich` array to use. |
 
-### Local preview cache and album rotation
+### Local media cache and album rotation
 
 The optional server-side cache stores Immich image previews and video posters on
-local disk. It is disabled by default; video playback itself continues to stream
-from Immich.
+local disk. Video playback itself continues to stream from Immich unless a
+separate full-video cache is enabled.
 
 | Name | Type | Default | Description |
 |---|---|---|---|
-| `cache` | boolean \| object | `false` | Enable the local preview cache. |
+| `cache` | boolean \| object | `false` | Enable the local media cache. |
 | `cache.directory` | string | `~/.cache/MMM-ImmichTileSlideShow` | Cache directory; set an absolute path on a mounted USB drive to move it off the SD card. |
-| `cache.maxBytes` | number | `8589934592` | Maximum cache size (8 GiB). The oldest unprotected previews are evicted first. |
+| `cache.maxBytes` | number | `8589934592` | Maximum preview/poster cache size (8 GiB). The oldest unprotected entries are evicted first. |
+| `cache.videoMaxBytes` | number | `0` | Separate full-video cache limit; `0` disables it. Cached videos are stored under `cache.directory/videos`, with one download at a time. |
 | `cache.concurrency` | number | `2` | Maximum number of preview downloads in flight; valid range is 1–8. |
 | `albumRotation` | boolean \| object | `false` | Rotate through selected albums while preparing the next album in the background. |
 | `albumRotation.intervalMinutes` | number | `60` | Time to show each album. If preparation is late, the current album remains visible. |
@@ -256,6 +257,12 @@ The active and next albums are protected from eviction while the next album is
 being prepared. When the configured size limit prevents storing a preview, that
 image still loads through the normal Immich proxy. A cache directory on a USB
 SSD can be selected with an absolute path after the drive is mounted.
+When `cache.videoMaxBytes` is greater than zero, complete video streams are
+prefetched into a separate bounded cache. The next album waits for its video
+downloads before switching; videos that are too large, unavailable, or not yet
+cached continue to stream from Immich. Cached video responses support HTTP byte
+ranges for playback and seeking. The first active album is shown immediately,
+so its videos may stream from Immich until background prefetch finishes.
 The selected album name is shown at the bottom-left of the display. A preview
 that is not yet cached is fetched through Immich, so its first appearance can
 wait on the network; later appearances use the local cache while the entry
@@ -267,6 +274,7 @@ config: {
     enabled: true,
     directory: "/mnt/usb/immich-preview-cache",
     maxBytes: 8 * 1024 * 1024 * 1024,
+    videoMaxBytes: 2 * 1024 * 1024 * 1024,
     concurrency: 2
   },
   albumRotation: {
@@ -293,9 +301,9 @@ config: {
 The module detects your Immich version and picks the right endpoints, then proxies media through MagicMirror so no credentials reach the browser.
 
 - **Images** — proxied Immich thumbnails. With `performance.lightweight`, the smaller `thumbnail` is tried first, then `preview`, then the original. Otherwise `preview` first.
-- **Videos** — the encoded video stream (v1.x `/assets/{id}/video`, v3+ `/assets/{id}/video/playback`) with a thumbnail poster. The poster is cached and preloaded like a photo; playback remains a network stream from Immich.
+- **Videos** — the encoded video stream (v1.x `/assets/{id}/video`, v3+ `/assets/{id}/video/playback`) with a thumbnail poster. Posters use the preview cache; full streams can be downloaded to the optional, separately bounded video cache.
 - **Large albums** — on Immich v3+, album assets are paged via `/search/metadata` and stream to the browser as they arrive, so a 6,000-photo album starts rendering after the first page instead of blocking.
-- **Local caching** — optional preview caching is keyed by asset version and rendition, so unchanged previews can be served without another NAS request. The active album is shown immediately; the next selected album is loaded and cached before the scheduled switch.
+- **Local caching** — previews and videos are keyed by asset version. Cached videos are served from disk with HTTP Range support; uncached or oversized videos fall back to the Immich stream. The next selected album is loaded and cached before the scheduled switch.
 
 ### Required API-key permissions
 
@@ -314,7 +322,8 @@ On pre-v3 servers `asset.read` also covers thumbnails and originals — the `ass
 ## Tests
 
 Run the built-in tests with `npm test`. They cover cache persistence, size limits,
-protected assets, video-poster preloading, and cache/rotation configuration validation.
+protected assets, video and poster preloading, range-capable video responses, and
+cache/rotation configuration validation.
 
 ## Migrating from v1
 

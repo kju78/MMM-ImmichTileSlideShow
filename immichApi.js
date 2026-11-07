@@ -13,6 +13,12 @@ const LOG_PREFIX = 'MMM-ImmichTileSlideShow :: immichApi :: ';
 const IMMICH_PROXY_URL = '/immichtilesslideshow/';
 const IMMICH_VIDEO_PROXY_URL = '/immichtilesslideshow-video/';
 
+function isCacheableVideoContentType(contentType) {
+  const mediaType = String(contentType || '').split(';', 1)[0].trim().toLowerCase();
+  return !mediaType || mediaType.startsWith('video/') ||
+    ['application/octet-stream', 'application/mp4', 'binary/octet-stream'].includes(mediaType);
+}
+
 const immichApi = {
   debugOn: false,
   apiUrls: {
@@ -95,7 +101,9 @@ const immichApi = {
   http: null,
   preferThumbnail: false,
   previewCache: null,
+  videoCache: null,
   _previewRequests: new Map(),
+  _videoRequests: new Map(),
 
   /**
    * Initialize HTTP client and set up proxy route
@@ -123,8 +131,32 @@ const immichApi = {
           });
         }
         await this.previewCache.initialize();
+
+        const videoMaxBytes = Number(cacheConfig.videoMaxBytes);
+        if (config.videos && config.videos.enabled === true && Number.isSafeInteger(videoMaxBytes) && videoMaxBytes > 0) {
+          const videoDirectory = path.join(path.resolve(directory), 'videos');
+          if (
+            !this.videoCache ||
+            this.videoCache.directory !== path.resolve(videoDirectory) ||
+            this.videoCache.maxBytes !== videoMaxBytes ||
+            this.videoCache.concurrency !== 1
+          ) {
+            this.videoCache = new PreviewCache({
+              directory: videoDirectory,
+              maxBytes: videoMaxBytes,
+              concurrency: 1,
+              fileExtension: 'bin',
+              label: 'Video cache',
+              logger: Log
+            });
+          }
+          await this.videoCache.initialize();
+        } else {
+          this.videoCache = null;
+        }
       } else {
         this.previewCache = null;
+        this.videoCache = null;
       }
 
       this.http = axios.create({
@@ -268,6 +300,33 @@ const immichApi = {
         if (this.debugOn) Log.info(LOG_PREFIX + '[debug] setting up video route at ' + IMMICH_VIDEO_PROXY_URL);
         expressApp.get(IMMICH_VIDEO_PROXY_URL + ':id', async (req, res) => {
           const assetId = req.params.id;
+          const assetVersion = typeof req.query.v === 'string' ? req.query.v : '';
+          if (this.videoCache) {
+            try {
+              const cached = await this.videoCache.get(assetId, assetVersion, 'video');
+              if (cached) {
+                const sendError = await new Promise((resolve) => {
+                  res.sendFile(cached.filePath, {
+                    acceptRanges: true,
+                    headers: {
+                      'Cache-Control': 'public, max-age=31536000, immutable',
+                      'Content-Type': cached.contentType || 'application/octet-stream'
+                    }
+                  }, (error) => resolve(error || null));
+                });
+                if (!sendError) return;
+                Log.warn(LOG_PREFIX + 'cached video read failed: ' + sendError.message);
+                if (req.aborted || res.destroyed) return;
+                if (res.headersSent) {
+                  res.end();
+                  return;
+                }
+              }
+            } catch (error) {
+              Log.warn(LOG_PREFIX + 'video cache request failed: ' + error.message);
+            }
+          }
+
           const urls = [];
           const conf = this.apiUrls[this.apiLevel];
           if (conf.videoStream) urls.push(conf.videoStream.replace('{id}', assetId));
@@ -617,30 +676,123 @@ const immichApi = {
     }
   },
 
-  prefetchTiles: async function (tiles) {
-    const previews = (tiles || []).filter((tile) =>
-      tile && tile.assetId && (tile.kind !== 'video' || Boolean(tile.posterSrc))
-    );
-    if (!this.previewCache || !previews.length) return { requested: previews.length, cached: 0, failed: 0 };
+  async _prefetchVideo(assetId, version) {
+    if (!this.videoCache) return null;
+    const cache = this.videoCache;
+    const cached = await cache.get(assetId, version, 'video');
+    if (cached) return cached;
 
-    this.previewCache.addProtectedAssets(previews);
+    const key = cache.key(assetId, version, 'video');
+    const existingRequest = this._videoRequests.get(key);
+    if (existingRequest) return existingRequest;
+
+    const request = cache.runLimited(async () => {
+      const secondCheck = await cache.get(assetId, version, 'video');
+      if (secondCheck) return secondCheck;
+
+      const conf = this.apiUrls[this.apiLevel];
+      const urls = [];
+      if (conf.videoStream) urls.push(conf.videoStream.replace('{id}', assetId));
+      if (conf.assetOriginal) urls.push(conf.assetOriginal.replace('{id}', assetId));
+
+      for (let index = 0; index < urls.length; index++) {
+        let upstream;
+        try {
+          upstream = await this.http.get(urls[index], {
+            responseType: 'stream',
+            headers: { Accept: 'video/*, application/octet-stream;q=0.8' }
+          });
+        } catch (error) {
+          if (index < urls.length - 1) continue;
+          Log.warn(LOG_PREFIX + 'video prefetch failed: ' + error.message);
+          return null;
+        }
+
+        const headers = upstream.headers || {};
+        const contentType = headers['content-type'] || 'application/octet-stream';
+        if (
+          upstream.status === 200 &&
+          !headers['content-range'] &&
+          isCacheableVideoContentType(contentType)
+        ) {
+          try {
+            return await cache.store(assetId, version, 'video', upstream.data, {
+              contentType,
+              etag: headers.etag,
+              contentLength: headers['content-length']
+            });
+          } catch (error) {
+            Log.warn(LOG_PREFIX + 'video cache write failed: ' + error.message);
+            return null;
+          }
+        }
+
+        if (upstream.data && typeof upstream.data.destroy === 'function') upstream.data.destroy();
+        const partialResponse = upstream.status === 206 || Boolean(headers['content-range']);
+        if (index < urls.length - 1 && (upstream.status === 404 || upstream.status === 410 || partialResponse)) {
+          continue;
+        }
+        if (upstream.status !== 404 && upstream.status !== 410) {
+          Log.warn(LOG_PREFIX + `video prefetch skipped a non-cacheable response (${upstream.status}, ${contentType}).`);
+        } else if (this.debugOn) {
+          Log.warn(LOG_PREFIX + `video prefetch skipped a missing asset (${upstream.status}).`);
+        }
+        return null;
+      }
+      return null;
+    });
+
+    this._videoRequests.set(key, request);
+    try {
+      return await request;
+    } finally {
+      if (this._videoRequests.get(key) === request) this._videoRequests.delete(key);
+    }
+  },
+
+  prefetchTiles: async function (tiles) {
+    const candidates = (tiles || []).filter((tile) => tile && tile.assetId);
+    const previews = candidates.filter((tile) => tile.kind !== 'video' || Boolean(tile.posterSrc));
+    const videos = candidates.filter((tile) => tile.kind === 'video');
+    if ((!this.previewCache && !this.videoCache) || !candidates.length) {
+      return { requested: previews.length, cached: 0, failed: 0 };
+    }
+
+    if (this.previewCache) this.previewCache.addProtectedAssets(previews);
+    if (this.videoCache) {
+      this.videoCache.addProtectedAssets(videos.map((tile) => ({ ...tile, cacheVariant: 'video' })));
+    }
+    const workTiles = candidates.filter((tile) =>
+      (this.previewCache && (tile.kind !== 'video' || Boolean(tile.posterSrc))) ||
+      (this.videoCache && tile.kind === 'video')
+    );
     let nextIndex = 0;
     let cached = 0;
     let failed = 0;
     const worker = async () => {
-      while (nextIndex < previews.length) {
-        const tile = previews[nextIndex++];
-        try {
-          if (await this._prefetchPreview(tile.assetId, tile.assetVersion, tile.cacheVariant)) cached += 1;
-          else failed += 1;
-        } catch (error) {
-          failed += 1;
-          if (this.debugOn) Log.warn(LOG_PREFIX + `preview cache failed for asset ${tile.assetId}: ${error.message}`);
+      while (nextIndex < workTiles.length) {
+        const tile = workTiles[nextIndex++];
+        if (this.previewCache && (tile.kind !== 'video' || Boolean(tile.posterSrc))) {
+          try {
+            if (await this._prefetchPreview(tile.assetId, tile.assetVersion, tile.cacheVariant)) cached += 1;
+            else failed += 1;
+          } catch (error) {
+            failed += 1;
+            if (this.debugOn) Log.warn(LOG_PREFIX + `preview cache failed for asset ${tile.assetId}: ${error.message}`);
+          }
+        }
+        if (this.videoCache && tile.kind === 'video') {
+          try {
+            await this._prefetchVideo(tile.assetId, tile.assetVersion);
+          } catch (error) {
+            Log.warn(LOG_PREFIX + 'video prefetch failed: ' + error.message);
+          }
         }
       }
     };
 
-    const workerCount = Math.min(this.previewCache.concurrency, previews.length);
+    const concurrency = this.previewCache ? this.previewCache.concurrency : this.videoCache.concurrency;
+    const workerCount = Math.min(Math.max(1, Number(concurrency) || 1), workTiles.length);
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
     return { requested: previews.length, cached, failed };
   },
@@ -651,8 +803,8 @@ const immichApi = {
     return IMMICH_PROXY_URL + imageId + query;
   },
 
-  getVideoLink: function (imageId) {
-    return IMMICH_VIDEO_PROXY_URL + imageId;
+  getVideoLink: function (imageId, version) {
+    return IMMICH_VIDEO_PROXY_URL + imageId + `?v=${encodeURIComponent(version || '')}`;
   }
 };
 
