@@ -189,9 +189,20 @@
     if (value == null) return [];
     const items = Array.isArray(value) ? value : [value];
     return items.map((item, index) => {
+      if (item && typeof item === 'object' && !(item instanceof RegExp) &&
+          !Array.isArray(item) && item.flags != null && typeof item.flags !== 'string') {
+        throw new Error(`albumRotation.patterns[${index}].flags must be a string.`);
+      }
       const pattern = item instanceof RegExp
         ? { source: item.source, flags: item.flags }
-        : { source: typeof item === 'string' ? item.trim() : '', flags: '' };
+        : typeof item === 'string'
+          ? { source: item.trim(), flags: '' }
+          : item && typeof item === 'object' && !Array.isArray(item)
+            ? {
+                source: typeof item.source === 'string' ? item.source.trim() : '',
+                flags: typeof item.flags === 'string' ? item.flags.trim() : ''
+              }
+            : { source: '', flags: '' };
       if (!pattern.source) throw new Error(`albumRotation.patterns[${index}] must be a non-empty regular expression.`);
       try {
         new RegExp(pattern.source, pattern.flags);

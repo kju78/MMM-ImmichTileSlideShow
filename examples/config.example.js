@@ -123,7 +123,10 @@
         intervalMinutes: 60,
         alignToHour: true,
         albums: [],
-        patterns: [/^\d{4}\s+(?:\p{Extended_Pictographic}|\p{Regional_Indicator}{2})/u]
+        patterns: [{
+          source: "^\\d{4}\\s+(?:\\p{Extended_Pictographic}|\\p{Regional_Indicator}{2})",
+          flags: "u"
+        }]
       },
       immich: {
         url: "http://your-immich-host:2283",

@@ -246,7 +246,7 @@ from Immich.
 | `albumRotation.intervalMinutes` | number | `60` | Time to show each album. If preparation is late, the current album remains visible. |
 | `albumRotation.alignToHour` | boolean | `false` | With a 60-minute interval, switch at local `HH:00` boundaries. If the next album is not ready, keep the current one until the next hour. |
 | `albumRotation.albums` | array \| string | `[]` | Exact album names or IDs to include. |
-| `albumRotation.patterns` | array \| RegExp | `[]` | Regular-expression source strings or RegExp values matched against album names. Use a RegExp literal with the `u` flag for Unicode emoji properties. Exact names and patterns are combined. |
+| `albumRotation.patterns` | array | `[]` | String patterns, RegExp values, or serializable `{ source, flags }` objects matched against album names. Exact names and patterns are combined. |
 
 If both album selectors are empty, rotation uses the album names and IDs from
 `immich.album`. The current album from `immich.album` is used as the starting
@@ -274,7 +274,10 @@ config: {
     intervalMinutes: 60,
     alignToHour: true,
     albums: [],
-    patterns: [/^\d{4}\s+(?:\p{Extended_Pictographic}|\p{Regional_Indicator}{2})/u]
+    patterns: [{
+      source: "^\\d{4}\\s+(?:\\p{Extended_Pictographic}|\\p{Regional_Indicator}{2})",
+      flags: "u"
+    }]
   },
   immich: {
     url: "http://your-immich-host:2283",
