@@ -229,7 +229,9 @@ test('shows initial album photos while deferring videos until their cache is rea
 
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].notification, 'IMMICH_TILES_DATA');
-  assert.deepEqual(notifications[0].payload.images.map((tile) => tile.kind), ['image']);
+  assert.deepEqual(notifications[0].payload.images.map((tile) => tile.kind), ['image', 'image']);
+  assert.equal(notifications[0].payload.images[1].videoPending, true);
+  assert.equal(notifications[0].payload.images[1].src, '/preview');
   assert.deepEqual(tiles.map((tile) => tile.kind), ['image', 'video']);
 
   releaseVideoCache({

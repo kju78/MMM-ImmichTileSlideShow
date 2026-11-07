@@ -568,6 +568,11 @@ async function _loadFromImmichImpl(context, options) {
       const progressiveTiles = [];
       const prefetchTasks = [];
       const videoPrefetchTasks = [];
+      const initialTileForDisplay = (tile) => {
+        if (tile.kind !== 'video') return tile;
+        if (!tile.posterSrc) return null;
+        return { ...tile, kind: 'image', src: tile.posterSrc, videoPending: true };
+      };
 
       const emitProgressiveTiles = (tiles) => {
         if (options.emit === false || !tiles.length) return;
@@ -607,7 +612,9 @@ async function _loadFromImmichImpl(context, options) {
           const photoTiles = pageTiles.filter((tile) => tile.kind !== 'video');
           const videoTiles = pageTiles.filter((tile) => tile.kind === 'video');
           if (photoTiles.length) startPrefetch(photoTiles);
-          if (!needsFinalSort) emitProgressiveTiles(photoTiles);
+          if (!needsFinalSort) {
+            emitProgressiveTiles(pageTiles.map(initialTileForDisplay).filter(Boolean));
+          }
 
           for (const tile of videoTiles) {
             const task = startPrefetch([tile]);
@@ -640,7 +647,7 @@ async function _loadFromImmichImpl(context, options) {
       if (deferVideoTilesUntilCached) {
         const tiles = sortTiles(progressiveTiles, cfg);
         if (needsFinalSort) {
-          emitProgressiveTiles(tiles.filter((tile) => tile.kind !== 'video'));
+          emitProgressiveTiles(tiles.map(initialTileForDisplay).filter(Boolean));
           Promise.all(videoPrefetchTasks).then(() => {
             emitProgressiveTiles(tiles.filter((tile) => tile.kind === 'video'));
           }, (error) => {

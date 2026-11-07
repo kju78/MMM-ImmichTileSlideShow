@@ -213,3 +213,33 @@ test('enforces the video concurrency limit and does not reload an unchanged URL'
   assert.equal(createdVideos[0].playCalls, 2);
   assert.equal(slideshow._activeVideos.size, 1);
 });
+
+test('upgrades a pending video poster into the video pool without duplicating it', () => {
+  const definition = loadModuleDefinition();
+  const photo = { kind: 'image', assetId: 'photo-1', src: '/photo' };
+  const poster = {
+    kind: 'image',
+    assetId: 'video-1',
+    src: '/poster',
+    videoPending: true
+  };
+  const video = { kind: 'video', assetId: 'video-1', src: '/video' };
+  const slideshow = {
+    images: [photo, poster],
+    _imagePool: [photo, poster],
+    _videoPool: [],
+    _nextImageIndex: 1,
+    log() {},
+    _setAlbumLabel() {},
+    _setDebugText() {}
+  };
+
+  definition.socketNotificationReceived.call(slideshow, 'IMMICH_TILES_APPEND', {
+    images: [video]
+  });
+
+  assert.deepEqual(slideshow.images, [photo, video]);
+  assert.deepEqual(slideshow._imagePool, [photo]);
+  assert.deepEqual(slideshow._videoPool, [video]);
+  assert.equal(slideshow._nextImageIndex, 0);
+});

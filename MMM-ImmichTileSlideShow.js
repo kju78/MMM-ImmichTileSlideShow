@@ -232,11 +232,32 @@ Module.register("MMM-ImmichTileSlideShow", {
       this.log("appending images:", payload.images.length);
       this._setAlbumLabel(payload.albumName);
       if (!Array.isArray(this.images)) this.images = [];
-      this.images.push(...payload.images);
+      if (!Array.isArray(this._imagePool)) this._imagePool = [];
+      if (!Array.isArray(this._videoPool)) this._videoPool = [];
       for (const m of payload.images) {
         const k = (m && m.kind) || 'image';
-        if (k === 'video') this._videoPool.push(m);
-        else this._imagePool.push(m);
+        const posterIndex = k === 'video' && m && m.assetId
+          ? this._imagePool.findIndex((item) =>
+              item && item.videoPending === true && String(item.assetId) === String(m.assetId))
+          : -1;
+        if (posterIndex >= 0) {
+          this._imagePool.splice(posterIndex, 1);
+          const imageIndex = this.images.findIndex((item) =>
+            item && item.videoPending === true && String(item.assetId) === String(m.assetId));
+          if (imageIndex >= 0) this.images[imageIndex] = m;
+          else this.images.push(m);
+          if (!this._imagePool.length) {
+            this._nextImageIndex = 0;
+          } else {
+            if (this._nextImageIndex > posterIndex) this._nextImageIndex -= 1;
+            this._nextImageIndex %= this._imagePool.length;
+          }
+          this._videoPool.push(m);
+        } else {
+          this.images.push(m);
+          if (k === 'video') this._videoPool.push(m);
+          else this._imagePool.push(m);
+        }
       }
       this._setDebugText(`media: ${this._imagePool.length} img, ${this._videoPool.length} vid`);
     }

@@ -261,8 +261,9 @@ image still loads through the normal Immich proxy. A cache directory on a USB
 disk can be selected with an absolute path after the drive is mounted.
 When `cache.videoMaxBytes` is greater than zero, complete video streams are
 prefetched into a separate bounded cache. On startup, photo tiles are sent
-without waiting for full video downloads; each video is added after its cache
-attempt finishes, so a large video cannot keep the screen on placeholders.
+without waiting for full video downloads; video poster tiles appear immediately,
+and each video is added after its cache attempt finishes, so a large video
+cannot keep the screen on placeholders.
 The next album is fully prefetched before the scheduled switch. Videos that are
 too large, unavailable, or blocked by the cache limit still stream from Immich;
 the helper logs when a video could not be cached.
