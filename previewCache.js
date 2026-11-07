@@ -18,7 +18,7 @@ class PreviewCache {
     this.maxBytes = Number(options.maxBytes);
     this.concurrency = Math.max(1, Math.floor(Number(options.concurrency) || 2));
     if (!Number.isSafeInteger(this.maxBytes) || this.maxBytes <= 0) {
-      throw new Error('Preview cache maxBytes must be a positive safe integer.');
+      throw new Error('Cache maxBytes must be a positive safe integer.');
     }
     this.maxEntryBytes = Number(options.maxEntryBytes == null ? this.maxBytes : options.maxEntryBytes);
     if (!Number.isSafeInteger(this.maxEntryBytes) || this.maxEntryBytes <= 0) {

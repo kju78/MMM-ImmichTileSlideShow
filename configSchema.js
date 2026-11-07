@@ -338,16 +338,31 @@
     const immich = immichRaw.map(normalizeImmich);
     const activeImmich = Math.max(0, Math.min(immich.length - 1, Number(raw.activeImmich) || 0));
 
+    const rawCache = raw.cache && typeof raw.cache === 'object' && !Array.isArray(raw.cache)
+      ? raw.cache
+      : {};
+    const hasPreviewMaxBytes = Object.prototype.hasOwnProperty.call(rawCache, 'previewMaxBytes');
+    const hasLegacyMaxBytes = Object.prototype.hasOwnProperty.call(rawCache, 'maxBytes');
+    if (
+      hasPreviewMaxBytes &&
+      hasLegacyMaxBytes &&
+      Number(rawCache.previewMaxBytes) !== Number(rawCache.maxBytes)
+    ) {
+      throw new Error('cache.previewMaxBytes and cache.maxBytes cannot have different values.');
+    }
+
     const cache = group(raw.cache, {
       directory: null,
-      maxBytes: 8 * 1024 * 1024 * 1024,
+      previewMaxBytes: 8 * 1024 * 1024 * 1024,
       videoMaxBytes: 0,
       concurrency: 2
     }, false);
     cache.directory = typeof cache.directory === 'string' && cache.directory.trim() ? cache.directory.trim() : null;
-    cache.maxBytes = Number(cache.maxBytes);
-    if (!Number.isSafeInteger(cache.maxBytes) || cache.maxBytes <= 0) {
-      throw new Error('cache.maxBytes must be a positive safe integer.');
+    if (!hasPreviewMaxBytes && hasLegacyMaxBytes) cache.previewMaxBytes = rawCache.maxBytes;
+    delete cache.maxBytes;
+    cache.previewMaxBytes = Number(cache.previewMaxBytes);
+    if (!Number.isSafeInteger(cache.previewMaxBytes) || cache.previewMaxBytes <= 0) {
+      throw new Error('cache.previewMaxBytes must be a positive safe integer.');
     }
     cache.videoMaxBytes = Number(cache.videoMaxBytes);
     if (!Number.isSafeInteger(cache.videoMaxBytes) || cache.videoMaxBytes < 0) {

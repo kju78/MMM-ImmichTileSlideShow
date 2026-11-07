@@ -105,35 +105,35 @@
       days: 30
     }
   }
+}
 
-  /* ─────────────────────────────────────────────────────────────
-   * 6. Local preview cache and hourly album rotation
-   * ───────────────────────────────────────────────────────────── */
-  {
-    module: "MMM-ImmichTileSlideShow",
-    config: {
-      cache: {
-        enabled: true,
-        directory: "/mnt/usb/immich-preview-cache",
-        maxBytes: 8 * 1024 * 1024 * 1024,
-        concurrency: 2
-      },
-      albumRotation: {
-        enabled: true,
-        intervalMinutes: 60,
-        alignToHour: true,
-        albums: [],
-        patterns: [{
-          source: "^\\d{4}\\s*(?:-\\s*)?(?:\\p{Extended_Pictographic}|\\p{Regional_Indicator}{2})",
-          flags: "u"
-        }]
-      },
-      immich: {
-        url: "http://your-immich-host:2283",
-        apiKey: "<YOUR_API_KEY>",
-        source: "album",
-        album: "Current album"
-      }
+/* ─────────────────────────────────────────────────────────────
+ * 6. Local preview cache and hourly album rotation
+ * ───────────────────────────────────────────────────────────── */
+{
+  module: "MMM-ImmichTileSlideShow",
+  config: {
+    cache: {
+      enabled: true,
+      directory: "/mnt/usb/immich-preview-cache",
+      previewMaxBytes: 8 * 1024 * 1024 * 1024,
+      videoMaxBytes: 2 * 1024 * 1024 * 1024,
+      concurrency: 2
+    },
+    albumRotation: {
+      enabled: true,
+      intervalMinutes: 60,
+      alignToHour: true,
+      albums: [],
+      patterns: [{
+        source: "^\\d{4}\\s*(?:-\\s*)?(?:\\p{Extended_Pictographic}|\\p{Regional_Indicator}{2})",
+        flags: "u"
+      }]
+    },
+    immich: {
+      url: "http://your-immich-host:2283",
+      apiKey: "<YOUR_API_KEY>",
+      source: "album"
     }
   }
 }

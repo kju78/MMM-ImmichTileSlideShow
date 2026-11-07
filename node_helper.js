@@ -91,10 +91,15 @@ module.exports = NodeHelper.create({
         load.catch((e) => {
           Log.error(LOG_PREFIX + 'Immich load failed: ' + e.message);
           if (rotation.enabled && immichCfg.source === 'album') {
-            _loadFromImmichImpl(this).catch((fallbackError) => {
-              Log.error(LOG_PREFIX + 'Immich fallback load failed: ' + fallbackError.message);
+            const hasFallbackAlbum = (immichCfg.albumNames || []).length || (immichCfg.albumIds || []).length;
+            if (hasFallbackAlbum) {
+              _loadFromImmichImpl(this).catch((fallbackError) => {
+                Log.error(LOG_PREFIX + 'Immich fallback load failed: ' + fallbackError.message);
+                this._sendInitialImages();
+              });
+            } else {
               this._sendInitialImages();
-            });
+            }
           } else {
             this._sendInitialImages();
           }

@@ -120,12 +120,12 @@ const immichApi = {
         if (
           !this.previewCache ||
           this.previewCache.directory !== path.resolve(directory) ||
-          this.previewCache.maxBytes !== cacheConfig.maxBytes ||
+          this.previewCache.maxBytes !== cacheConfig.previewMaxBytes ||
           this.previewCache.concurrency !== cacheConfig.concurrency
         ) {
           this.previewCache = new PreviewCache({
             directory,
-            maxBytes: cacheConfig.maxBytes,
+            maxBytes: cacheConfig.previewMaxBytes,
             concurrency: cacheConfig.concurrency,
             logger: Log
           });

@@ -239,8 +239,8 @@ separate full-video cache is enabled.
 | Name | Type | Default | Description |
 |---|---|---|---|
 | `cache` | boolean \| object | `false` | Enable the local media cache. |
-| `cache.directory` | string | `~/.cache/MMM-ImmichTileSlideShow` | Cache directory; set an absolute path on a mounted USB drive to move it off the SD card. |
-| `cache.maxBytes` | number | `8589934592` | Maximum preview/poster cache size (8 GiB). The oldest unprotected entries are evicted first. |
+| `cache.directory` | string | `~/.cache/MMM-ImmichTileSlideShow` | Cache directory; set an absolute path on a mounted USB drive to move both caches off the SD card. |
+| `cache.previewMaxBytes` | number | `8589934592` | Preview/poster cache size limit (8 GiB). The oldest unprotected entries are evicted first. Legacy `cache.maxBytes` remains supported as an alias. |
 | `cache.videoMaxBytes` | number | `0` | Separate full-video cache limit; `0` disables it. Cached videos are stored under `cache.directory/videos`, with one download at a time. |
 | `cache.concurrency` | number | `2` | Maximum number of preview downloads in flight; valid range is 1–8. |
 | `albumRotation` | boolean \| object | `false` | Rotate through selected albums while preparing the next album in the background. |
@@ -251,18 +251,26 @@ separate full-video cache is enabled.
 
 If both album selectors are empty, rotation uses the album names and IDs from
 `immich.album`. Each module start chooses a random matching album, then rotation
-advances through the selected candidates. Rotation only accepts `source: "album"`.
+advances through the selected candidates. If names or patterns are configured,
+`immich.album` is not used for normal selection; it is only a fallback after a
+rotation startup error. Rotation only accepts `source: "album"`.
 
 The active and next albums are protected from eviction while the next album is
 being prepared. When the configured size limit prevents storing a preview, that
 image still loads through the normal Immich proxy. A cache directory on a USB
-SSD can be selected with an absolute path after the drive is mounted.
+disk can be selected with an absolute path after the drive is mounted.
 When `cache.videoMaxBytes` is greater than zero, complete video streams are
 prefetched into a separate bounded cache. The next album waits for its video
 downloads before switching; videos that are too large, unavailable, or not yet
 cached continue to stream from Immich. Cached video responses support HTTP byte
 ranges for playback and seeking. The first active album is shown immediately,
 so its videos may stream from Immich until background prefetch finishes.
+The preview and video limits are independent, not one shared total: setting
+them to 8 GiB and 2 GiB respectively allows up to 10 GiB of cached files. A
+video download can temporarily add up to another `videoMaxBytes` while it is
+written. Repeated SD reads are generally less of a wear concern than writing
+and replacing cache entries; point `cache.directory` at a mounted USB disk to
+move both caches and their writes off the SD card.
 The selected album name is shown at the bottom-left of the display. A preview
 that is not yet cached is fetched through Immich, so its first appearance can
 wait on the network; later appearances use the local cache while the entry
@@ -273,7 +281,7 @@ config: {
   cache: {
     enabled: true,
     directory: "/mnt/usb/immich-preview-cache",
-    maxBytes: 8 * 1024 * 1024 * 1024,
+    previewMaxBytes: 8 * 1024 * 1024 * 1024,
     videoMaxBytes: 2 * 1024 * 1024 * 1024,
     concurrency: 2
   },
@@ -290,8 +298,7 @@ config: {
   immich: {
     url: "http://your-immich-host:2283",
     apiKey: "<YOUR_API_KEY>",
-    source: "album",
-    album: "Current album"
+    source: "album"
   }
 }
 ```
