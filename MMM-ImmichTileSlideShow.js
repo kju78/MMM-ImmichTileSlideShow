@@ -220,7 +220,7 @@ Module.register("MMM-ImmichTileSlideShow", {
       this._splitMedia();
       this._cadenceIndex = 0;
       this._cadenceSeq = null;
-      this._fillTilesInitial();
+      this._fillTilesInitial(true);
       this._startRotation();
       this._started = true;
       this._setDebugText(`media: ${this._imagePool.length} img, ${this._videoPool.length} vid`);
@@ -386,8 +386,9 @@ Module.register("MMM-ImmichTileSlideShow", {
 
   /**
    * Populate the grid once with a staggered effect.
+   * @param {boolean} [animate=false] Fade tiles as they are populated.
    */
-  _fillTilesInitial() {
+  _fillTilesInitial(animate = false) {
     this.log('filling initial tiles, current images:', this.images && this.images.length);
     const usePlaceholders = !this.images || this.images.length === 0;
     const total = this.tileEls.length;
@@ -397,7 +398,7 @@ Module.register("MMM-ImmichTileSlideShow", {
       setTimeout(() => {
         const img = usePlaceholders ? this._placeholderImage(i) : this._nextImageForTile(tile);
         this.log('apply initial tile', i, 'placeholder?', usePlaceholders);
-        this._applyTile(tile, img);
+        this._applyTile(tile, img, animate);
       }, delay);
     }
     // After initial fill, choose a few featured tiles near center and enlarge them
@@ -917,6 +918,7 @@ Module.register("MMM-ImmichTileSlideShow", {
     if (!this._container) return;
     // Update CSS variables for layout based on container size
     this._updateLayoutVars();
+    const animateAddedTiles = Boolean(this.images && this.images.length);
     // Manual layout: honor tileCols/tileRows exactly (plus a small buffer for
     // smooth swaps); trim any surplus DOM tiles left over from initial fill.
     if (this.cfg.layout.auto === false) {
@@ -929,7 +931,7 @@ Module.register("MMM-ImmichTileSlideShow", {
         for (let i = this.tileEls.length - added; i < this.tileEls.length; i++) {
           const tile = this.tileEls[i];
           const media = (this.images && this.images.length) ? this._nextImage() : this._placeholderImage(i);
-          this._applyTile(tile, media);
+          this._applyTile(tile, media, animateAddedTiles);
         }
       }
       return;
@@ -945,7 +947,7 @@ Module.register("MMM-ImmichTileSlideShow", {
         for (let i = this.tileEls.length - added; i < this.tileEls.length; i++) {
           const tile = this.tileEls[i];
           const media = (this.images && this.images.length) ? this._nextImageForTile(tile) : this._placeholderImage(i);
-          this._applyTile(tile, media);
+          this._applyTile(tile, media, animateAddedTiles);
         }
       }
       return;
@@ -968,7 +970,7 @@ Module.register("MMM-ImmichTileSlideShow", {
       for (let i = this.tileEls.length - added; i < this.tileEls.length; i++) {
         const tile = this.tileEls[i];
         const media = (this.images && this.images.length) ? this._nextImage() : this._placeholderImage(i);
-        this._applyTile(tile, media);
+        this._applyTile(tile, media, animateAddedTiles);
       }
       // Re-apply featured tiles on capacity change
       this._clearFeaturedTiles();

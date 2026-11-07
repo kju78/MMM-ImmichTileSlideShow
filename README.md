@@ -157,7 +157,7 @@ Grouped options accept `true`, `false`, **or** an object of settings — so `vid
 | Name | Type | Default | Description |
 |---|---|---|---|
 | `interval` | number | `10000` | Milliseconds between tile swaps. |
-| `transition` | string | `"fade"` | `"fade"` or `"slide"`. |
+| `transition` | string | `"fade"` | `"fade"` or `"slide"`, used for timed tile swaps and when new album data replaces visible tiles. |
 | `transitionMs` | number | `600` | Transition duration in ms. |
 | `randomize` | boolean | `true` | Swap a random tile each interval instead of cycling in order. |
 | `staggerMs` | number | `250` | Stagger between tiles during the initial fill. |
