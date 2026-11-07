@@ -755,7 +755,14 @@ const immichApi = {
     const previews = candidates.filter((tile) => tile.kind !== 'video' || Boolean(tile.posterSrc));
     const videos = candidates.filter((tile) => tile.kind === 'video');
     if ((!this.previewCache && !this.videoCache) || !candidates.length) {
-      return { requested: previews.length, cached: 0, failed: 0 };
+      return {
+        requested: previews.length,
+        cached: 0,
+        failed: 0,
+        videosRequested: 0,
+        videosCached: 0,
+        videosFailed: 0
+      };
     }
 
     if (this.previewCache) this.previewCache.addProtectedAssets(previews);
@@ -769,6 +776,8 @@ const immichApi = {
     let nextIndex = 0;
     let cached = 0;
     let failed = 0;
+    let videosCached = 0;
+    let videosFailed = 0;
     const worker = async () => {
       while (nextIndex < workTiles.length) {
         const tile = workTiles[nextIndex++];
@@ -783,8 +792,10 @@ const immichApi = {
         }
         if (this.videoCache && tile.kind === 'video') {
           try {
-            await this._prefetchVideo(tile.assetId, tile.assetVersion);
+            if (await this._prefetchVideo(tile.assetId, tile.assetVersion)) videosCached += 1;
+            else videosFailed += 1;
           } catch (error) {
+            videosFailed += 1;
             Log.warn(LOG_PREFIX + 'video prefetch failed: ' + error.message);
           }
         }
@@ -794,7 +805,14 @@ const immichApi = {
     const concurrency = this.previewCache ? this.previewCache.concurrency : this.videoCache.concurrency;
     const workerCount = Math.min(Math.max(1, Number(concurrency) || 1), workTiles.length);
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
-    return { requested: previews.length, cached, failed };
+    return {
+      requested: previews.length,
+      cached,
+      failed,
+      videosRequested: this.videoCache ? videos.length : 0,
+      videosCached,
+      videosFailed
+    };
   },
 
   getImageLink: function (imageId, version) {

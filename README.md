@@ -260,17 +260,19 @@ being prepared. When the configured size limit prevents storing a preview, that
 image still loads through the normal Immich proxy. A cache directory on a USB
 disk can be selected with an absolute path after the drive is mounted.
 When `cache.videoMaxBytes` is greater than zero, complete video streams are
-prefetched into a separate bounded cache. The next album waits for its video
-downloads before switching; videos that are too large, unavailable, or not yet
-cached continue to stream from Immich. Cached video responses support HTTP byte
-ranges for playback and seeking. The first active album is shown immediately,
-so its videos may stream from Immich until background prefetch finishes.
-The preview and video limits are independent, not one shared total: setting
-them to 8 GiB and 2 GiB respectively allows up to 10 GiB of cached files. A
-video download can temporarily add up to another `videoMaxBytes` while it is
-written. Repeated SD reads are generally less of a wear concern than writing
-and replacing cache entries; point `cache.directory` at a mounted USB disk to
-move both caches and their writes off the SD card.
+prefetched into a separate bounded cache. With caching enabled, the initial
+album and each next album wait for their cache attempts to finish before being
+shown. Videos that are too large, unavailable, or blocked by the cache limit
+still stream from Immich; the helper logs when a video could not be cached.
+Cached video responses support HTTP byte ranges for playback and seeking.
+Both the active and next albums are protected while the next album is prepared,
+so size the video cache to hold both. The preview and video limits are
+independent, not one shared total: setting them to 4 GiB and 6 GiB respectively
+allows up to 10 GiB of cached files. A video download can temporarily add up
+to another `videoMaxBytes` while it is written. Repeated SD reads are generally
+less of a wear concern than writing and replacing cache entries; point
+`cache.directory` at a mounted USB disk to move both caches and their writes
+off the SD card.
 The selected album name is shown at the bottom-left of the display. A preview
 that is not yet cached is fetched through Immich, so its first appearance can
 wait on the network; later appearances use the local cache while the entry
@@ -309,7 +311,7 @@ The module detects your Immich version and picks the right endpoints, then proxi
 
 - **Images** — proxied Immich thumbnails. With `performance.lightweight`, the smaller `thumbnail` is tried first, then `preview`, then the original. Otherwise `preview` first.
 - **Videos** — the encoded video stream (v1.x `/assets/{id}/video`, v3+ `/assets/{id}/video/playback`) with a thumbnail poster. Posters use the preview cache; full streams can be downloaded to the optional, separately bounded video cache.
-- **Large albums** — on Immich v3+, album assets are paged via `/search/metadata` and stream to the browser as they arrive, so a 6,000-photo album starts rendering after the first page instead of blocking.
+- **Large albums** — on Immich v3+, album assets are paged via `/search/metadata`. Without local caching, pages stream as they arrive; with caching enabled, the album waits for its preview/video prefetches before rendering.
 - **Local caching** — previews and videos are keyed by asset version. Cached videos are served from disk with HTTP Range support; uncached or oversized videos fall back to the Immich stream. The next selected album is loaded and cached before the scheduled switch.
 
 ### Required API-key permissions
@@ -442,6 +444,12 @@ config: {
   videos: { maxConcurrent: 1, preload: "none" }
 }
 ```
+
+For a Raspberry Pi 4, use Immich's server-side video transcoding to produce
+H.264 playback at 720p first; try 1080p only if playback stays smooth. The
+slideshow caches the playback response by asset version, so clear
+`cache.directory/videos` after changing Immich's transcoding settings to avoid
+reusing previously cached 4K streams.
 
 For the smoothest result, run MagicMirror in server mode on a stronger machine and point the Pi's browser at it.
 

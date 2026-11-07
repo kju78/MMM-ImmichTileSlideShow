@@ -71,10 +71,12 @@
   grid-row: span 2;
 }
 
-.transition-fade .immich-tile.swap { animation: mmmitss-fade var(--mmmitss-transition) ease; }
+.transition-fade .immich-tile.swap-out { animation: mmmitss-fade-out var(--mmmitss-transition-phase, 300ms) ease-in both; }
+.transition-fade .immich-tile.swap-in { animation: mmmitss-fade-in var(--mmmitss-transition-phase, 300ms) ease-out both; }
 .transition-slide .immich-tile.swap { animation: mmmitss-slide-up var(--mmmitss-transition) ease; }
 
-@keyframes mmmitss-fade { 0% { opacity: 0.4; } 100% { opacity: 1; } }
+@keyframes mmmitss-fade-out { to { opacity: 0; } }
+@keyframes mmmitss-fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes mmmitss-slide-up { 0% { transform: translateY(6%); opacity: 0.2; } 100% { transform: translateY(0); opacity: 1; } }
 
 .immich-tile-media, .immich-tile-img, .immich-tile-video {

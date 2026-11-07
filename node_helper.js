@@ -282,6 +282,26 @@ function _setCacheProtection(immichApi, tiles) {
   }
 }
 
+function _logPrefetchResults(results) {
+  const summary = (results || []).reduce((total, result) => {
+    if (!result) return total;
+    total.previewFailed += Number(result.failed) || 0;
+    total.videosRequested += Number(result.videosRequested) || 0;
+    total.videosCached += Number(result.videosCached) || 0;
+    total.videosFailed += Number(result.videosFailed) || 0;
+    return total;
+  }, { previewFailed: 0, videosRequested: 0, videosCached: 0, videosFailed: 0 });
+
+  if (summary.previewFailed) {
+    Log.warn(LOG_PREFIX + `${summary.previewFailed} album preview(s) were not cached.`);
+  }
+  if (summary.videosFailed) {
+    Log.warn(LOG_PREFIX + `${summary.videosFailed}/${summary.videosRequested} album video(s) were not cached; they may stream from Immich.`);
+  } else if (summary.videosRequested) {
+    Log.info(LOG_PREFIX + `Album video cache ready (${summary.videosCached}/${summary.videosRequested}).`);
+  }
+}
+
 async function _initializeImmich(context, cfg, force) {
   const immichApi = require('./immichApi.js');
   immichApi.debugOn = !!(context.config && context.config.debug);
@@ -502,6 +522,9 @@ async function _loadFromImmichImpl(context, options) {
   const validVideoSet = new Set(context.config.videoExtensions || []);
 
   if (!options.skipInit) await _initializeImmich(context, cfg, true);
+  const waitForCache = options.waitForCache === true ||
+    (options.waitForCache !== false &&
+      Boolean(context.config.cache && context.config.cache.enabled && (immichApi.previewCache || immichApi.videoCache)));
   let albumName = options.album && options.album.name ? options.album.name : null;
   if (!albumName && cfg.source === 'album' && (cfg.albumNames || []).length === 1) {
     albumName = cfg.albumNames[0];
@@ -526,9 +549,8 @@ async function _loadFromImmichImpl(context, options) {
     }
     if (albumIds.length) {
 
-      // Progressive delivery: stream pages to the frontend as they arrive so the
-      // mirror can start rendering after the first page instead of waiting for
-      // the entire album to page in.
+      // Without a cache wait, stream pages as they arrive. When caching is
+      // enabled, hold all pages until their media prefetches have completed.
       const sortMode = cfg.sort;
       const needsFinalSort = sortMode === 'name' || sortMode === 'created' || sortMode === 'modified' || sortMode === 'taken';
       let firstPageSent = false;
@@ -548,7 +570,7 @@ async function _loadFromImmichImpl(context, options) {
             return null;
           }));
         }
-        if (options.emit === false || needsFinalSort) return;
+        if (options.emit === false || waitForCache || needsFinalSort) return;
         if (!firstPageSent) {
           firstPageSent = true;
           Log.info(LOG_PREFIX + `First page ready — sending ${pageTiles.length} tile(s) to frontend`);
@@ -562,8 +584,15 @@ async function _loadFromImmichImpl(context, options) {
       images = await immichApi.getAlbumAssetsForAlbumIds(albumIds, { onPage });
       dlog(context, 'album assets total', images && images.length);
 
-      if (options.waitForCache) await Promise.all(prefetchTasks);
+      if (waitForCache) _logPrefetchResults(await Promise.all(prefetchTasks));
       if (options.emit === false) return sortTiles(progressiveTiles, cfg);
+
+      if (waitForCache) {
+        const tiles = sortTiles(progressiveTiles, cfg);
+        Log.info(LOG_PREFIX + `Album media cache ready — sending ${tiles.length} tile(s) to frontend.`);
+        context.sendSocketNotification('IMMICH_TILES_DATA', { images: tiles, albumName });
+        return tiles;
+      }
 
       if (needsFinalSort) {
         // Single terminal emission for date/name sorts — the frontend receives
@@ -640,9 +669,11 @@ async function _loadFromImmichImpl(context, options) {
   });
   dlog(context, 'mapped tiles', tiles && tiles.length);
   if (cfg.source !== 'album' && (immichApi.previewCache || immichApi.videoCache)) {
-    const prefetch = immichApi.prefetchTiles(tiles);
-    if (options.waitForCache) await prefetch;
-    else prefetch.catch((error) => Log.warn(LOG_PREFIX + 'Could not prefetch media: ' + error.message));
+    if (waitForCache) {
+      _logPrefetchResults([await immichApi.prefetchTiles(tiles)]);
+    } else {
+      immichApi.prefetchTiles(tiles).catch((error) => Log.warn(LOG_PREFIX + 'Could not prefetch media: ' + error.message));
+    }
   }
 
   // No server-side pool cap; all filtered media are returned.

@@ -61,11 +61,48 @@ test('preloads video files and poster previews alongside image previews', async 
     { kind: 'video', assetId: 'video-2', assetVersion: '3', cacheVariant: 'preview' }
   ]);
 
-  assert.deepEqual(result, { requested: 2, cached: 2, failed: 0 });
+  assert.deepEqual(result, {
+    requested: 2,
+    cached: 2,
+    failed: 0,
+    videosRequested: 2,
+    videosCached: 2,
+    videosFailed: 0
+  });
   assert.deepEqual(requestedAssets.map((item) => item.assetId).sort(), ['image-1', 'video-1']);
   assert.deepEqual(protectedTiles.map((item) => item.assetId).sort(), ['image-1', 'video-1']);
   assert.deepEqual(requestedVideos.map((item) => item.assetId).sort(), ['video-1', 'video-2']);
   assert.deepEqual(protectedVideos.map((item) => item.cacheVariant), ['video', 'video']);
+});
+
+test('reports videos that could not be cached', async (t) => {
+  const originalPreviewCache = immichApi.previewCache;
+  const originalVideoCache = immichApi.videoCache;
+  const originalVideoPrefetch = immichApi._prefetchVideo;
+  immichApi.previewCache = null;
+  immichApi.videoCache = {
+    concurrency: 1,
+    addProtectedAssets() {}
+  };
+  immichApi._prefetchVideo = async () => null;
+  t.after(() => {
+    immichApi.previewCache = originalPreviewCache;
+    immichApi.videoCache = originalVideoCache;
+    immichApi._prefetchVideo = originalVideoPrefetch;
+  });
+
+  const result = await immichApi.prefetchTiles([
+    { kind: 'video', assetId: 'video-uncached', assetVersion: '1' }
+  ]);
+
+  assert.deepEqual(result, {
+    requested: 0,
+    cached: 0,
+    failed: 0,
+    videosRequested: 1,
+    videosCached: 0,
+    videosFailed: 1
+  });
 });
 
 test('skips partial video responses and caches a complete fallback stream', async (t) => {

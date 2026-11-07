@@ -129,7 +129,7 @@ Module.register("MMM-ImmichTileSlideShow", {
     this._nextImageIndex = 0;
     this._nextVideoIndex = 0;
     this._started = false;
-    this._activeVideoCount = 0;
+    this._activeVideos = new Set();
     this._imagePool = [];
     this._videoPool = [];
     this._cadenceIndex = 0;
@@ -582,13 +582,71 @@ Module.register("MMM-ImmichTileSlideShow", {
    * @param {boolean} [animate]
    */
   _applyTile(tile, image, animate = false) {
+    if (!tile || !image) return;
+    const transitionToken = (Number(tile.dataset.mmmitssTransitionToken) || 0) + 1;
+    const previousSrc = tile.dataset.mmmitssMediaSrc || '';
+    const nextSrc = String(image.src || '');
+    const sourceChanged = previousSrc !== nextSrc;
+    tile.dataset.mmmitssTransitionToken = String(transitionToken);
+    tile.classList.remove('swap', 'swap-in', 'swap-out');
+
+    if (animate && this.cfg.transition === 'fade' && previousSrc && sourceChanged) {
+      this._fadeTileToMedia(tile, image, transitionToken);
+      return;
+    }
+
+    this._applyTileContent(tile, image);
+    tile.dataset.mmmitssMediaSrc = nextSrc;
+    this._applyMosaicSpans(tile, image);
+
+    if (!animate || !sourceChanged) return;
+    if (this.cfg.transition === 'fade') {
+      this._fadeTileIn(tile, transitionToken, Number(this.cfg.transitionMs) || 0);
+    } else {
+      void tile.offsetWidth;
+      tile.classList.add('swap');
+      setTimeout(() => {
+        if (tile.dataset.mmmitssTransitionToken === String(transitionToken)) tile.classList.remove('swap');
+      }, Math.max(200, this.cfg.transitionMs));
+    }
+  },
+
+  _fadeTileToMedia(tile, image, transitionToken) {
+    const duration = Math.max(0, Number(this.cfg.transitionMs) || 0);
+    const fadeOutMs = Math.ceil(duration / 2);
+    const fadeInMs = duration - fadeOutMs;
+    tile.style.setProperty('--mmmitss-transition-phase', `${fadeOutMs}ms`);
+    void tile.offsetWidth;
+    tile.classList.add('swap-out');
+
+    setTimeout(() => {
+      if (tile.dataset.mmmitssTransitionToken !== String(transitionToken)) return;
+      tile.classList.remove('swap-out');
+      this._applyTileContent(tile, image);
+      tile.dataset.mmmitssMediaSrc = String(image.src || '');
+      this._applyMosaicSpans(tile, image);
+      this._fadeTileIn(tile, transitionToken, fadeInMs);
+    }, fadeOutMs);
+  },
+
+  _fadeTileIn(tile, transitionToken, duration) {
+    if (duration <= 0) return;
+    tile.style.setProperty('--mmmitss-transition-phase', `${duration}ms`);
+    tile.classList.add('swap-in');
+    setTimeout(() => {
+      if (tile.dataset.mmmitssTransitionToken === String(transitionToken)) tile.classList.remove('swap-in');
+    }, duration);
+  },
+
+  _applyTileContent(tile, image) {
     const imgEl = tile.querySelector(".immich-tile-img");
     let vidEl = tile.querySelector("video.immich-tile-video");
     const capEl = tile.querySelector(".immich-tile-caption");
     if (!imgEl || !capEl) return;
 
     // Tear down any prior video element if switching kinds
-    if (vidEl && image.kind !== 'video') {
+    if (vidEl && (image.kind !== 'video' || !this.cfg.videos.enabled)) {
+      this._activeVideos.delete(vidEl);
       try {
         vidEl.pause();
         vidEl.removeAttribute('src');
@@ -596,7 +654,6 @@ Module.register("MMM-ImmichTileSlideShow", {
       } catch (e) {}
       vidEl.remove();
       vidEl = null;
-      this._activeVideoCount = Math.max(0, this._activeVideoCount - 1);
     }
 
     if (image.kind === 'video' && this.cfg.videos.enabled) {
@@ -606,28 +663,46 @@ Module.register("MMM-ImmichTileSlideShow", {
         vidEl.muted = !!this.cfg.videos.muted;
         vidEl.loop = !!this.cfg.videos.loop;
         vidEl.playsInline = true;
-        vidEl.autoplay = !!this.cfg.videos.autoplay;
+        vidEl.autoplay = false;
         vidEl.preload = String(this.cfg.videos.preload || 'metadata');
+        const videoElement = vidEl;
+        const releaseVideo = () => this._activeVideos.delete(videoElement);
+        vidEl.addEventListener('ended', releaseVideo);
+        vidEl.addEventListener('pause', releaseVideo);
         // place into media container
         const media = tile.querySelector('.immich-tile-media') || tile;
         media.appendChild(vidEl);
       }
       // set sources/poster
       if (image.posterSrc) vidEl.poster = image.posterSrc;
-      if (vidEl.src !== image.src) vidEl.src = image.src;
+      else vidEl.removeAttribute('poster');
+      if (vidEl.getAttribute('src') !== image.src) {
+        if (!vidEl.paused) vidEl.pause();
+        this._activeVideos.delete(vidEl);
+        vidEl.src = image.src;
+      }
       // hide the background image layer
       imgEl.style.backgroundImage = image.posterSrc ? `url('${image.posterSrc}')` : '';
       // Play with concurrency guard
-      const canPlay = this._activeVideoCount < Number(this.cfg.videos.maxConcurrent || 1);
-      if (canPlay && this.cfg.videos.autoplay) {
-        // Attempt playback
-        vidEl.play().then(() => {
-          this._activeVideoCount++;
-          vidEl.onended = () => { this._activeVideoCount = Math.max(0, this._activeVideoCount - 1); };
-          vidEl.onpause = () => { this._activeVideoCount = Math.max(0, this._activeVideoCount - 1); };
-        }).catch(() => {
-          // Autoplay may be blocked; show poster background
-        });
+      const maxConcurrent = Math.max(0, Number(this.cfg.videos.maxConcurrent) || 0);
+      if (
+        this.cfg.videos.autoplay &&
+        !this._activeVideos.has(vidEl) &&
+        this._activeVideos.size < maxConcurrent
+      ) {
+        this._activeVideos.add(vidEl);
+        try {
+          const playback = vidEl.play();
+          if (playback && typeof playback.catch === 'function') {
+            playback.catch((error) => {
+              this._activeVideos.delete(vidEl);
+              this.log('video playback rejected:', error.message);
+            });
+          }
+        } catch (error) {
+          this._activeVideos.delete(vidEl);
+          this.log('video playback rejected:', error.message);
+        }
       }
     } else {
       // Image mode: set background-image and remove any video
@@ -649,17 +724,6 @@ Module.register("MMM-ImmichTileSlideShow", {
       capEl.style.display = "none";
     }
 
-    if (animate) {
-      tile.classList.remove("swap");
-      // force reflow to restart animation
-      // eslint-disable-next-line no-unused-expressions
-      void tile.offsetWidth;
-      tile.classList.add("swap");
-      setTimeout(() => tile.classList.remove("swap"), Math.max(200, this.cfg.transitionMs));
-    }
-
-    // Adjust mosaic spans by orientation
-    this._applyMosaicSpans(tile, image);
   },
 
   /**
@@ -693,7 +757,10 @@ Module.register("MMM-ImmichTileSlideShow", {
       try { this._mmObserver.disconnect(); } catch (e) {}
       this._mmObserver = null;
     }
-    this._activeVideoCount = 0;
+    for (const video of this._activeVideos) {
+      try { video.pause(); } catch (e) {}
+    }
+    this._activeVideos.clear();
     this._unbindResize();
     if (this._sizeCacheTimer) { try { clearInterval(this._sizeCacheTimer); } catch (_) {} this._sizeCacheTimer = null; }
     // Remove injected root to avoid leakage on restarts
