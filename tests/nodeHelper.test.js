@@ -6,6 +6,7 @@ const test = require('node:test');
 
 const originalLoad = Module._load;
 let nodeHelper;
+let immichApi;
 Module._load = function (request, parent, isMain) {
   if (request === 'node_helper') return { create: (definition) => definition };
   if (request === 'logger') return { debug() {}, error() {}, info() {}, warn() {} };
@@ -13,6 +14,7 @@ Module._load = function (request, parent, isMain) {
 };
 try {
   nodeHelper = require('../node_helper');
+  immichApi = require('../immichApi');
 } finally {
   Module._load = originalLoad;
 }
@@ -36,7 +38,6 @@ test('chooses a random starting album index within the candidate list', (t) => {
 });
 
 test('waits for the initial album cache before sending tiles to the frontend', async (t) => {
-  const immichApi = require('../immichApi');
   const keys = [
     'init',
     'getAlbumNameToIdMap',

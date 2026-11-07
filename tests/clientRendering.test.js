@@ -60,6 +60,8 @@ test('fades old tile media out before applying and fading in the replacement', (
   const applied = [];
   const slideshow = {
     cfg: { transition: 'fade', transitionMs: 100 },
+    _fadeTileToMedia: definition._fadeTileToMedia,
+    _fadeTileIn: definition._fadeTileIn,
     _applyTileContent(_tile, image) {
       applied.push(image.src);
     },
