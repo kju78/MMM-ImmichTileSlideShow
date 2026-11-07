@@ -249,8 +249,8 @@ from Immich.
 | `albumRotation.patterns` | array | `[]` | String patterns, RegExp values, or serializable `{ source, flags }` objects matched against album names. Exact names and patterns are combined. |
 
 If both album selectors are empty, rotation uses the album names and IDs from
-`immich.album`. The current album from `immich.album` is used as the starting
-album when it matches the selection. Rotation only accepts `source: "album"`.
+`immich.album`. Each module start chooses a random matching album, then rotation
+advances through the selected candidates. Rotation only accepts `source: "album"`.
 
 The active and next albums are protected from eviction while the next album is
 being prepared. When the configured size limit prevents storing a preview, that
@@ -275,7 +275,7 @@ config: {
     alignToHour: true,
     albums: [],
     patterns: [{
-      source: "^\\d{4}\\s+(?:\\p{Extended_Pictographic}|\\p{Regional_Indicator}{2})",
+      source: "^\\d{4}\\s*(?:-\\s*)?(?:\\p{Extended_Pictographic}|\\p{Regional_Indicator}{2})",
       flags: "u"
     }]
   },

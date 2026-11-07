@@ -13,7 +13,7 @@ const albumConfig = {
 };
 
 const yearAndEmoji = {
-  source: '^\\d{4}\\s+(?:\\p{Extended_Pictographic}|\\p{Regional_Indicator}{2})',
+  source: '^\\d{4}\\s*(?:-\\s*)?(?:\\p{Extended_Pictographic}|\\p{Regional_Indicator}{2})',
   flags: 'u'
 };
 
@@ -40,6 +40,8 @@ test('normalizes cache and album rotation settings, including RegExp patterns', 
   const pattern = new RegExp(config.albumRotation.patterns[0].source, config.albumRotation.patterns[0].flags);
   assert.equal(pattern.test('2026 🏕️ Husbilsresan'), true);
   assert.equal(pattern.test('2026 🇸🇪 Sommar'), true);
+  assert.equal(pattern.test('2017 - 🇺🇸 Chicago'), true);
+  assert.equal(pattern.test('2023⛪Vadstena Kloster'), true);
   assert.equal(pattern.test('2026 Semester'), false);
   assert.equal(pattern.test('2026'), false);
 });

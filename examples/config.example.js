@@ -124,7 +124,7 @@
         alignToHour: true,
         albums: [],
         patterns: [{
-          source: "^\\d{4}\\s+(?:\\p{Extended_Pictographic}|\\p{Regional_Indicator}{2})",
+          source: "^\\d{4}\\s*(?:-\\s*)?(?:\\p{Extended_Pictographic}|\\p{Regional_Indicator}{2})",
           flags: "u"
         }]
       },

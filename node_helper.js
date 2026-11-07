@@ -407,16 +407,17 @@ async function _rotateAlbum(context) {
   _scheduleAlbumRotation(context, _rotationDelay(state));
 }
 
+function _randomAlbumIndex(candidateCount) {
+  return candidateCount > 1 ? Math.floor(Math.random() * candidateCount) : 0;
+}
+
 async function _startAlbumRotation(context) {
   const cfg = activeImmich(context.config);
   const immichApi = await _initializeImmich(context, cfg, true);
   if (immichApi.previewCache) immichApi.previewCache.setProtectedAssets([]);
 
   const candidates = await _resolveRotationAlbums(context, cfg, immichApi);
-  const configuredIds = new Set((cfg.albumIds || []).map((id) => id.toLowerCase()));
-  const currentIndex = Math.max(0, candidates.findIndex((album) =>
-    configuredIds.has(album.id.toLowerCase()) || (cfg.albumNames || []).includes(album.name)
-  ));
+  const currentIndex = _randomAlbumIndex(candidates.length);
   if (candidates.length < 2) {
     Log.info(LOG_PREFIX + 'Album rotation matched fewer than two albums; loading the selected album without rotation.');
     await _loadFromImmichImpl(context, {
@@ -641,3 +642,4 @@ async function _loadFromImmichImpl(context, options) {
 
 // Bind to the module object
 module.exports._loadFromImmich = _loadFromImmichImpl;
+module.exports._randomAlbumIndex = _randomAlbumIndex;
