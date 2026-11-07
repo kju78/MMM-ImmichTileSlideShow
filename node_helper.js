@@ -87,7 +87,12 @@ module.exports = NodeHelper.create({
         const rotation = this.config.albumRotation || {};
         const load = rotation.enabled && immichCfg.source === 'album'
           ? _startAlbumRotation(this)
-          : _loadFromImmichImpl(this);
+          : immichCfg.source === 'album'
+            ? _loadFromImmichImpl(this, {
+                waitForCache: false,
+                deferVideoTilesUntilCached: true
+              })
+            : _loadFromImmichImpl(this);
         load.catch((e) => {
           Log.error(LOG_PREFIX + 'Immich load failed: ' + e.message);
           if (rotation.enabled && immichCfg.source === 'album') {
@@ -460,7 +465,9 @@ async function _startAlbumRotation(context) {
     await _loadFromImmichImpl(context, {
       album: candidates[currentIndex],
       keepCachePins: true,
-      skipInit: true
+      skipInit: true,
+      waitForCache: false,
+      deferVideoTilesUntilCached: true
     });
     return;
   }
@@ -482,7 +489,9 @@ async function _startAlbumRotation(context) {
   state.currentTiles = await _loadFromImmichImpl(context, {
     album: candidates[currentIndex],
     keepCachePins: true,
-    skipInit: true
+    skipInit: true,
+    waitForCache: false,
+    deferVideoTilesUntilCached: true
   });
   _setCacheProtection(immichApi, state.currentTiles);
 
@@ -525,6 +534,7 @@ async function _loadFromImmichImpl(context, options) {
   const waitForCache = options.waitForCache === true ||
     (options.waitForCache !== false &&
       Boolean(context.config.cache && context.config.cache.enabled && (immichApi.previewCache || immichApi.videoCache)));
+  const deferVideoTilesUntilCached = options.deferVideoTilesUntilCached === true && !waitForCache;
   let albumName = options.album && options.album.name ? options.album.name : null;
   if (!albumName && cfg.source === 'album' && (cfg.albumNames || []).length === 1) {
     albumName = cfg.albumNames[0];
@@ -549,14 +559,42 @@ async function _loadFromImmichImpl(context, options) {
     }
     if (albumIds.length) {
 
-      // Without a cache wait, stream pages as they arrive. When caching is
-      // enabled, hold all pages until their media prefetches have completed.
+      // Initial album loads can show photos while full video files cache in the
+      // background. Staged albums still wait for every cache attempt.
       const sortMode = cfg.sort;
       const needsFinalSort = sortMode === 'name' || sortMode === 'created' || sortMode === 'modified' || sortMode === 'taken';
       let firstPageSent = false;
       const appendedRaw = [];
       const progressiveTiles = [];
       const prefetchTasks = [];
+      const videoPrefetchTasks = [];
+
+      const emitProgressiveTiles = (tiles) => {
+        if (options.emit === false || !tiles.length) return;
+        const firstBatch = !firstPageSent;
+        firstPageSent = true;
+        if (firstBatch) {
+          Log.info(LOG_PREFIX + `First page ready — sending ${tiles.length} tile(s) to frontend`);
+        } else {
+          dlog(context, `appending ${tiles.length} tile(s) to pool`);
+        }
+        context.sendSocketNotification(firstBatch ? 'IMMICH_TILES_DATA' : 'IMMICH_TILES_APPEND', {
+          images: tiles,
+          albumName
+        });
+      };
+
+      const startPrefetch = (tiles) => {
+        if (!tiles.length || (!immichApi.previewCache && !immichApi.videoCache)) {
+          return Promise.resolve(null);
+        }
+        const task = immichApi.prefetchTiles(tiles).catch((error) => {
+          Log.warn(LOG_PREFIX + 'Could not prefetch album media: ' + error.message);
+          return null;
+        });
+        prefetchTasks.push(task);
+        return task;
+      };
 
       const onPage = (items) => {
         appendedRaw.push(...items);
@@ -564,28 +602,53 @@ async function _loadFromImmichImpl(context, options) {
         if (!pageTiles.length) return;
         if (sortMode === 'random' && !needsFinalSort) shuffle(pageTiles);
         progressiveTiles.push(...pageTiles);
-        if (immichApi.previewCache || immichApi.videoCache) {
-          prefetchTasks.push(immichApi.prefetchTiles(pageTiles).catch((error) => {
-            Log.warn(LOG_PREFIX + 'Could not prefetch album media: ' + error.message);
-            return null;
-          }));
+
+        if (deferVideoTilesUntilCached) {
+          const photoTiles = pageTiles.filter((tile) => tile.kind !== 'video');
+          const videoTiles = pageTiles.filter((tile) => tile.kind === 'video');
+          if (photoTiles.length) startPrefetch(photoTiles);
+          if (!needsFinalSort) emitProgressiveTiles(photoTiles);
+
+          for (const tile of videoTiles) {
+            const task = startPrefetch([tile]);
+            videoPrefetchTasks.push(task);
+            if (!needsFinalSort && options.emit !== false) {
+              task.then(() => emitProgressiveTiles([tile])).catch((error) => {
+                Log.error(LOG_PREFIX + 'Could not send cached video tile: ' + error.message);
+              });
+            }
+          }
+          return;
         }
+
+        if (immichApi.previewCache || immichApi.videoCache) startPrefetch(pageTiles);
         if (options.emit === false || waitForCache || needsFinalSort) return;
-        if (!firstPageSent) {
-          firstPageSent = true;
-          Log.info(LOG_PREFIX + `First page ready — sending ${pageTiles.length} tile(s) to frontend`);
-          context.sendSocketNotification('IMMICH_TILES_DATA', { images: pageTiles, albumName });
-        } else {
-          dlog(context, `appending ${pageTiles.length} tile(s) to pool`);
-          context.sendSocketNotification('IMMICH_TILES_APPEND', { images: pageTiles, albumName });
-        }
+        emitProgressiveTiles(pageTiles);
       };
 
       images = await immichApi.getAlbumAssetsForAlbumIds(albumIds, { onPage });
       dlog(context, 'album assets total', images && images.length);
 
       if (waitForCache) _logPrefetchResults(await Promise.all(prefetchTasks));
+      else if (deferVideoTilesUntilCached && prefetchTasks.length) {
+        Promise.all(prefetchTasks).then(_logPrefetchResults, (error) => {
+          Log.warn(LOG_PREFIX + 'Could not summarize album media cache: ' + error.message);
+        });
+      }
       if (options.emit === false) return sortTiles(progressiveTiles, cfg);
+
+      if (deferVideoTilesUntilCached) {
+        const tiles = sortTiles(progressiveTiles, cfg);
+        if (needsFinalSort) {
+          emitProgressiveTiles(tiles.filter((tile) => tile.kind !== 'video'));
+          Promise.all(videoPrefetchTasks).then(() => {
+            emitProgressiveTiles(tiles.filter((tile) => tile.kind === 'video'));
+          }, (error) => {
+            Log.error(LOG_PREFIX + 'Could not finish album video prefetch: ' + error.message);
+          });
+        }
+        return tiles;
+      }
 
       if (waitForCache) {
         const tiles = sortTiles(progressiveTiles, cfg);

@@ -126,3 +126,123 @@ test('waits for the initial album cache before sending tiles to the frontend', a
   assert.equal(notifications[0].payload.images[0].kind, 'video');
   assert.equal(tiles.length, 1);
 });
+
+test('shows initial album photos while deferring videos until their cache is ready', async (t) => {
+  const keys = [
+    'init',
+    'getAlbumNameToIdMap',
+    'getAlbumAssetsForAlbumIds',
+    'prefetchTiles',
+    'getImageLink',
+    'getVideoLink',
+    'previewCache',
+    'videoCache'
+  ];
+  const originals = Object.fromEntries(keys.map((key) => [key, immichApi[key]]));
+  t.after(() => {
+    for (const key of keys) immichApi[key] = originals[key];
+  });
+
+  let releaseVideoCache;
+  let reportVideoPrefetchStarted;
+  let reportVideoSent;
+  const videoCacheGate = new Promise((resolve) => {
+    releaseVideoCache = resolve;
+  });
+  const videoPrefetchStarted = new Promise((resolve) => {
+    reportVideoPrefetchStarted = resolve;
+  });
+  const videoSent = new Promise((resolve) => {
+    reportVideoSent = resolve;
+  });
+  const assets = [
+    {
+      id: 'photo-1',
+      type: 'IMAGE',
+      originalFileName: 'photo.jpg',
+      updatedAt: 'photo-version'
+    },
+    {
+      id: 'video-1',
+      type: 'VIDEO',
+      originalFileName: 'clip.mp4',
+      updatedAt: 'video-version'
+    }
+  ];
+  immichApi.init = async () => {};
+  immichApi.getAlbumNameToIdMap = async () => new Map([['Album', 'album-1']]);
+  immichApi.getAlbumAssetsForAlbumIds = async (_albumIds, { onPage }) => {
+    onPage(assets);
+    return assets;
+  };
+  immichApi.prefetchTiles = (tiles) => {
+    if (tiles[0].kind === 'video') {
+      reportVideoPrefetchStarted();
+      return videoCacheGate;
+    }
+    return Promise.resolve({
+      requested: tiles.length,
+      cached: tiles.length,
+      failed: 0,
+      videosRequested: 0,
+      videosCached: 0,
+      videosFailed: 0
+    });
+  };
+  immichApi.getImageLink = () => '/preview';
+  immichApi.getVideoLink = () => '/video';
+  immichApi.previewCache = { setProtectedAssets() {} };
+  immichApi.videoCache = { setProtectedAssets() {} };
+
+  const notifications = [];
+  const context = {
+    config: {
+      immich: [{
+        url: 'http://immich',
+        apiKey: 'test-key',
+        source: 'album',
+        albumIds: ['album-1'],
+        albumNames: [],
+        sort: 'none',
+        sortDesc: false
+      }],
+      activeImmich: 0,
+      cache: { enabled: true },
+      videos: { enabled: true },
+      imageExtensions: ['jpg'],
+      videoExtensions: ['mp4'],
+      debug: false
+    },
+    expressApp: {},
+    sendSocketNotification(notification, payload) {
+      notifications.push({ notification, payload });
+      if (notification === 'IMMICH_TILES_APPEND') reportVideoSent();
+    }
+  };
+
+  const loading = nodeHelper._loadFromImmich(context, {
+    waitForCache: false,
+    deferVideoTilesUntilCached: true
+  });
+  await videoPrefetchStarted;
+  const tiles = await loading;
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].notification, 'IMMICH_TILES_DATA');
+  assert.deepEqual(notifications[0].payload.images.map((tile) => tile.kind), ['image']);
+  assert.deepEqual(tiles.map((tile) => tile.kind), ['image', 'video']);
+
+  releaseVideoCache({
+    requested: 1,
+    cached: 1,
+    failed: 0,
+    videosRequested: 1,
+    videosCached: 1,
+    videosFailed: 0
+  });
+  await videoSent;
+
+  assert.equal(notifications.length, 2);
+  assert.equal(notifications[1].notification, 'IMMICH_TILES_APPEND');
+  assert.deepEqual(notifications[1].payload.images.map((tile) => tile.kind), ['video']);
+});
