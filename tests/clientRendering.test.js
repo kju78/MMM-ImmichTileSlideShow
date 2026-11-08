@@ -29,6 +29,90 @@ function loadModuleDefinition(options = {}) {
   return definition;
 }
 
+test('album picker sorts albums and filters names without case sensitivity', () => {
+  const definition = loadModuleDefinition();
+  const slideshow = {
+    cfg: { albumRotation: { enabled: true } },
+    _albumPickerAlbums: [
+      { id: 'z', name: 'Zeta' },
+      { id: 'b', name: 'Bravo 10' },
+      { id: 'a', name: 'Alpha' }
+    ],
+    translate(key) {
+      return key === 'ALBUM_PICKER_ROTATION' ? 'Automatic rotation' : key;
+    }
+  };
+
+  const allNames = Array.from(
+    definition._getAlbumPickerItems.call(slideshow, ''),
+    (item) => item.name
+  );
+  const filteredNames = Array.from(
+    definition._getAlbumPickerItems.call(slideshow, 'bRa'),
+    (item) => item.name
+  );
+
+  assert.deepEqual(allNames, ['Automatic rotation', 'Alpha', 'Bravo 10', 'Zeta']);
+  assert.deepEqual(filteredNames, ['Bravo 10']);
+});
+
+test('album picker keyboard opens, navigates, selects, and closes', () => {
+  const definition = loadModuleDefinition();
+  const actions = [];
+  const slideshow = {
+    _albumPickerOpen: false,
+    _albumPickerVisibleItems: [{ id: 'one' }, { id: 'two' }],
+    _albumPickerActiveIndex: 0,
+    _albumPickerSelectionRequestId: null,
+    _albumPickerAvailable: () => true,
+    _openAlbumPicker() {
+      actions.push('open');
+      this._albumPickerOpen = true;
+    },
+    _closeAlbumPicker() {
+      actions.push('close');
+      this._albumPickerOpen = false;
+    },
+    _renderAlbumPickerList() {
+      actions.push('render');
+    },
+    _activateAlbumPickerItem(item) {
+      actions.push(item.id);
+    }
+  };
+  const keyEvent = (key, target = { tagName: 'DIV' }) => ({
+    key,
+    target,
+    prevented: false,
+    stopped: false,
+    preventDefault() {
+      this.prevented = true;
+    },
+    stopPropagation() {
+      this.stopped = true;
+    }
+  });
+
+  const open = keyEvent('a');
+  definition._handleAlbumPickerKeydown.call(slideshow, open);
+  assert.equal(slideshow._albumPickerOpen, true);
+  assert.equal(open.prevented, true);
+
+  definition._handleAlbumPickerKeydown.call(slideshow, keyEvent('ArrowDown'));
+  assert.equal(slideshow._albumPickerActiveIndex, 1);
+  definition._handleAlbumPickerKeydown.call(slideshow, keyEvent('Enter'));
+  assert.equal(actions.includes('two'), true);
+
+  definition._handleAlbumPickerKeydown.call(slideshow, keyEvent('Escape'));
+  assert.equal(slideshow._albumPickerOpen, false);
+  assert.equal(actions.at(-1), 'close');
+
+  const inputKey = keyEvent('a', { tagName: 'INPUT' });
+  definition._handleAlbumPickerKeydown.call(slideshow, inputKey);
+  assert.equal(inputKey.prevented, false);
+  assert.equal(actions.filter((action) => action === 'open').length, 1);
+});
+
 function makeClassList() {
   const classes = new Set();
   return {
@@ -383,7 +467,8 @@ test('upgrades a pending video poster into the video pool without duplicating it
     _nextImageIndex: 1,
     log() {},
     _setAlbumLabel() {},
-    _setDebugText() {}
+    _setDebugText() {},
+    _shouldAcceptAlbumPickerMedia: () => true
   };
 
   definition.socketNotificationReceived.call(slideshow, 'IMMICH_TILES_APPEND', {

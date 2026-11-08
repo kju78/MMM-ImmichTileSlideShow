@@ -1,4 +1,14 @@
 {
-  "TITLE": "Immich Tiles"
+  "TITLE": "Immich Tiles",
+  "ALBUM_PICKER_TITLE": "Choose an album",
+  "ALBUM_PICKER_CLOSE": "Close",
+  "ALBUM_PICKER_HINT": "Type to search | Up/Down to navigate | Enter to select | Esc to close",
+  "ALBUM_PICKER_SEARCH": "Search albums",
+  "ALBUM_PICKER_LOADING": "Loading albums...",
+  "ALBUM_PICKER_NO_ALBUMS": "No albums were returned by Immich.",
+  "ALBUM_PICKER_NO_MATCHES": "No matching albums.",
+  "ALBUM_PICKER_ROTATION": "Automatic rotation",
+  "ALBUM_PICKER_RESUMING": "Resuming automatic rotation...",
+  "ALBUM_PICKER_SELECTING": "Loading album: ",
+  "ALBUM_PICKER_REQUEST_FAILED": "The album request failed."
 }
-

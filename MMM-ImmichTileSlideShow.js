@@ -129,6 +129,20 @@ Module.register("MMM-ImmichTileSlideShow", {
     this.images = /** @type {TileImage[]} */ ([]);
     this._albumName = '';
     this._albumLabel = null;
+    this._albumPickerOpen = false;
+    this._albumPickerAlbums = [];
+    this._albumPickerVisibleItems = [];
+    this._albumPickerActiveIndex = 0;
+    this._albumPickerRequestSeq = 0;
+    this._albumPickerLoadRequestId = null;
+    this._albumPickerSelectionRequestId = null;
+    this._activeAlbumPickerRequestId = null;
+    this._albumPickerLoading = false;
+    this._albumPickerStatusError = false;
+    this._albumPickerPreferCurrent = false;
+    this._albumPickerKeyHandler = (event) => this._handleAlbumPickerKeydown(event);
+    this._albumPickerPreviousFocus = null;
+    this._albumPickerCloseButton = null;
     this.tileEls = [];
     this._rotationTimer = null;
     this._featuredTimer = null;
@@ -147,6 +161,10 @@ Module.register("MMM-ImmichTileSlideShow", {
     this._sizeCacheTimer = null;
     this._initialFilled = false;
     this._fitPlan = null;
+
+    if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+      document.addEventListener("keydown", this._albumPickerKeyHandler);
+    }
 
     // Lightweight mode: no client-side behavioral changes beyond Immich asset preference.
 
@@ -222,7 +240,14 @@ Module.register("MMM-ImmichTileSlideShow", {
    * @param {any} payload
    */
   socketNotificationReceived(notification, payload) {
-    if (notification === "IMMICH_TILES_DATA" && payload && Array.isArray(payload.images)) {
+    if (notification === "IMMICH_TILES_ALBUMS") {
+      this._handleAlbumPickerAlbums(payload);
+    } else if (notification === "IMMICH_TILES_ALBUM_ERROR") {
+      this._handleAlbumPickerError(payload);
+    } else if (notification === "IMMICH_TILES_ALBUM_SELECTION_DONE") {
+      this._handleAlbumPickerSelectionDone(payload);
+    } else if (notification === "IMMICH_TILES_DATA" && payload && Array.isArray(payload.images)) {
+      if (!this._shouldAcceptAlbumPickerMedia(payload)) return;
       this.log("received images:", payload.images.length);
       this._setAlbumLabel(payload.albumName);
       this.images = payload.images;
@@ -236,6 +261,7 @@ Module.register("MMM-ImmichTileSlideShow", {
       this._recalculateTiles();
       this._maybeStartScroll();
     } else if (notification === "IMMICH_TILES_APPEND" && payload && Array.isArray(payload.images) && payload.images.length) {
+      if (!this._shouldAcceptAlbumPickerMedia(payload)) return;
       // Progressive album loading: append subsequent pages to the existing pool
       // without disturbing rotation or already-rendered tiles.
       this.log("appending images:", payload.images.length);
@@ -410,8 +436,340 @@ Module.register("MMM-ImmichTileSlideShow", {
     root.appendChild(albumLabel);
     this._albumLabel = albumLabel;
 
+    this._buildAlbumPicker(root);
+
     this._container = wrapper;
     return root;
+  },
+
+  _buildAlbumPicker(root) {
+    const picker = document.createElement('div');
+    picker.className = 'immich-album-picker';
+    picker.hidden = true;
+    picker.setAttribute('role', 'dialog');
+    picker.setAttribute('aria-modal', 'true');
+    picker.setAttribute('aria-label', this.translate('ALBUM_PICKER_TITLE'));
+    picker.tabIndex = -1;
+    picker.addEventListener('click', (event) => {
+      if (event.target === picker) this._closeAlbumPicker();
+    });
+
+    const panel = document.createElement('div');
+    panel.className = 'immich-album-picker-panel';
+    panel.addEventListener('click', (event) => event.stopPropagation());
+
+    const header = document.createElement('div');
+    header.className = 'immich-album-picker-header';
+
+    const title = document.createElement('h2');
+    title.className = 'immich-album-picker-title';
+    title.textContent = this.translate('ALBUM_PICKER_TITLE');
+    header.appendChild(title);
+
+    const closeButton = document.createElement('button');
+    closeButton.className = 'immich-album-picker-close';
+    closeButton.type = 'button';
+    closeButton.textContent = 'X';
+    closeButton.setAttribute('aria-label', this.translate('ALBUM_PICKER_CLOSE'));
+    closeButton.addEventListener('click', () => this._closeAlbumPicker());
+    header.appendChild(closeButton);
+    panel.appendChild(header);
+
+    const hint = document.createElement('div');
+    hint.className = 'immich-album-picker-hint';
+    hint.textContent = this.translate('ALBUM_PICKER_HINT');
+    panel.appendChild(hint);
+
+    const search = document.createElement('input');
+    search.className = 'immich-album-picker-search';
+    search.type = 'search';
+    search.autocomplete = 'off';
+    search.placeholder = this.translate('ALBUM_PICKER_SEARCH');
+    search.setAttribute('aria-label', this.translate('ALBUM_PICKER_SEARCH'));
+    search.addEventListener('input', () => {
+      this._albumPickerStatusError = false;
+      this._albumPickerPreferCurrent = false;
+      this._renderAlbumPickerList();
+    });
+    panel.appendChild(search);
+
+    const status = document.createElement('div');
+    status.className = 'immich-album-picker-status';
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    panel.appendChild(status);
+
+    const list = document.createElement('div');
+    list.className = 'immich-album-picker-list';
+    list.setAttribute('role', 'listbox');
+    list.setAttribute('aria-label', this.translate('ALBUM_PICKER_TITLE'));
+    panel.appendChild(list);
+    picker.appendChild(panel);
+    root.appendChild(picker);
+
+    this._albumPicker = picker;
+    this._albumPickerSearch = search;
+    this._albumPickerStatus = status;
+    this._albumPickerList = list;
+    this._albumPickerCloseButton = closeButton;
+  },
+
+  _albumPickerAvailable() {
+    const servers = this.cfg && Array.isArray(this.cfg.immich) ? this.cfg.immich : [];
+    const index = Number(this.cfg && this.cfg.activeImmich) || 0;
+    const active = servers[index] || servers[0];
+    return !!active && active.source === 'album';
+  },
+
+  _getAlbumPickerItems(query) {
+    const albums = (Array.isArray(this._albumPickerAlbums) ? this._albumPickerAlbums : [])
+      .filter((album) => album && album.id != null && typeof album.name === 'string' && album.name.trim())
+      .map((album) => ({ type: 'album', id: String(album.id), name: album.name.trim() }));
+    const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
+    albums.sort((left, right) => collator.compare(left.name, right.name) || left.id.localeCompare(right.id));
+
+    const items = [];
+    if (albums.length && this.cfg && this.cfg.albumRotation && this.cfg.albumRotation.enabled) {
+      items.push({
+        type: 'rotation',
+        id: null,
+        name: this.translate('ALBUM_PICKER_ROTATION')
+      });
+    }
+    items.push(...albums);
+
+    const filter = String(query || '').trim().toLocaleLowerCase();
+    return filter ? items.filter((item) => item.name.toLocaleLowerCase().includes(filter)) : items;
+  },
+
+  _renderAlbumPickerList() {
+    if (!this._albumPickerList) return;
+    while (this._albumPickerList.firstChild) {
+      this._albumPickerList.removeChild(this._albumPickerList.firstChild);
+    }
+
+    const previous = this._albumPickerVisibleItems[this._albumPickerActiveIndex] || null;
+    const items = this._getAlbumPickerItems(this._albumPickerSearch && this._albumPickerSearch.value);
+    let activeIndex = previous
+      ? items.findIndex((item) => item.type === previous.type && item.id === previous.id)
+      : -1;
+    if (activeIndex < 0 && this._albumPickerPreferCurrent && this._albumName) {
+      const currentName = this._albumName.toLocaleLowerCase();
+      activeIndex = items.findIndex((item) =>
+        item.type === 'album' && item.name.toLocaleLowerCase() === currentName);
+    }
+    if (activeIndex < 0) activeIndex = 0;
+
+    this._albumPickerVisibleItems = items;
+    this._albumPickerActiveIndex = items.length ? activeIndex : 0;
+    this._albumPickerPreferCurrent = false;
+    this._albumPickerList.setAttribute('aria-busy', this._albumPickerLoading ? 'true' : 'false');
+
+    const currentName = this._albumName.toLocaleLowerCase();
+    for (let index = 0; index < items.length; index++) {
+      const item = items[index];
+      const isCurrent = item.type === 'album' && item.name.toLocaleLowerCase() === currentName;
+      const option = document.createElement('button');
+      option.className = 'immich-album-picker-option';
+      if (index === this._albumPickerActiveIndex) option.className += ' active';
+      if (isCurrent) option.className += ' current';
+      option.type = 'button';
+      option.disabled = this._albumPickerLoading;
+      option.textContent = item.name;
+      option.setAttribute('role', 'option');
+      option.setAttribute('aria-selected', index === this._albumPickerActiveIndex ? 'true' : 'false');
+      if (isCurrent) option.setAttribute('aria-current', 'true');
+      option.addEventListener('click', () => {
+        this._albumPickerActiveIndex = index;
+        this._activateAlbumPickerItem(item);
+      });
+      this._albumPickerList.appendChild(option);
+      if (index === this._albumPickerActiveIndex && typeof option.scrollIntoView === 'function') {
+        option.scrollIntoView({ block: 'nearest' });
+      }
+    }
+
+    if (!this._albumPickerLoading && !this._albumPickerStatusError) {
+      if (!items.length) {
+        const hasAlbums = Array.isArray(this._albumPickerAlbums) && this._albumPickerAlbums.length > 0;
+        this._setAlbumPickerStatus(
+          this.translate(hasAlbums ? 'ALBUM_PICKER_NO_MATCHES' : 'ALBUM_PICKER_NO_ALBUMS'),
+          false
+        );
+      } else {
+        this._setAlbumPickerStatus('', false);
+      }
+    }
+  },
+
+  _handleAlbumPickerKeydown(event) {
+    if (!event || !event.key) return;
+    const consume = () => {
+      if (typeof event.preventDefault === 'function') event.preventDefault();
+      if (typeof event.stopPropagation === 'function') event.stopPropagation();
+    };
+
+    if (this._albumPickerOpen) {
+      if (event.key === 'Escape') {
+        consume();
+        this._closeAlbumPicker();
+        return;
+      }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        consume();
+        if (this._albumPickerSelectionRequestId != null || !this._albumPickerVisibleItems.length) return;
+        const direction = event.key === 'ArrowDown' ? 1 : -1;
+        const count = this._albumPickerVisibleItems.length;
+        this._albumPickerActiveIndex = (this._albumPickerActiveIndex + direction + count) % count;
+        this._renderAlbumPickerList();
+        return;
+      }
+      if (event.key === 'Enter') {
+        consume();
+        if (this._albumPickerSelectionRequestId != null) return;
+        const item = this._albumPickerVisibleItems[this._albumPickerActiveIndex];
+        if (item) this._activateAlbumPickerItem(item);
+      }
+      return;
+    }
+
+    if (String(event.key).toLowerCase() !== 'a' || event.altKey || event.ctrlKey || event.metaKey) return;
+    const target = event.target || {};
+    const tagName = String(target.tagName || '').toUpperCase();
+    if (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(tagName)) return;
+    if (!this._albumPickerAvailable()) return;
+    consume();
+    this._openAlbumPicker();
+  },
+
+  _openAlbumPicker() {
+    if (this._albumPickerOpen || this._albumPickerSelectionRequestId != null) return;
+    if (!this._root) {
+      if (this.cfg.fullscreen !== false) this._ensureRootFullscreen();
+      else this._ensureRootInline();
+    }
+    if (!this._albumPicker) return;
+    if (document.body && this._albumPicker.parentNode !== document.body) {
+      document.body.appendChild(this._albumPicker);
+    }
+
+    this._albumPickerOpen = true;
+    this._albumPicker.hidden = false;
+    this._albumPickerPreviousFocus = document.activeElement || null;
+    this._albumPickerAlbums = [];
+    this._albumPickerVisibleItems = [];
+    this._albumPickerActiveIndex = 0;
+    this._albumPickerSearch.value = '';
+    this._albumPickerPreferCurrent = true;
+    this._albumPickerStatusError = false;
+    this._albumPickerLoadRequestId = ++this._albumPickerRequestSeq;
+    this._setAlbumPickerBusy(true);
+    this._setAlbumPickerStatus(this.translate('ALBUM_PICKER_LOADING'), false);
+    this._renderAlbumPickerList();
+    this._albumPickerSearch.focus();
+    this.sendSocketNotification('IMMICH_TILES_GET_ALBUMS', {
+      requestId: this._albumPickerLoadRequestId
+    });
+  },
+
+  _closeAlbumPicker(force = false) {
+    if (this._albumPickerSelectionRequestId != null && !force) return;
+    this._albumPickerOpen = false;
+    this._albumPickerLoadRequestId = null;
+    this._albumPickerLoading = false;
+    this._setAlbumPickerBusy(false);
+    if (!this._albumPicker) return;
+    this._albumPicker.hidden = true;
+    if (this._root && this._albumPicker.parentNode !== this._root) {
+      this._root.appendChild(this._albumPicker);
+    }
+    this._setAlbumPickerStatus('', false);
+    const previousFocus = this._albumPickerPreviousFocus;
+    this._albumPickerPreviousFocus = null;
+    if (!force && previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
+  },
+
+  _setAlbumPickerBusy(busy) {
+    this._albumPickerLoading = busy;
+    if (this._albumPickerSearch) this._albumPickerSearch.disabled = busy;
+    if (this._albumPickerCloseButton) this._albumPickerCloseButton.disabled = busy;
+    if (this._albumPickerList) this._albumPickerList.setAttribute('aria-busy', busy ? 'true' : 'false');
+  },
+
+  _setAlbumPickerStatus(message, isError) {
+    this._albumPickerStatusError = !!isError;
+    if (!this._albumPickerStatus) return;
+    const text = String(message || '');
+    this._albumPickerStatus.textContent = text;
+    this._albumPickerStatus.className = 'immich-album-picker-status' + (isError ? ' error' : '');
+    this._albumPickerStatus.hidden = !text;
+  },
+
+  _handleAlbumPickerAlbums(payload) {
+    if (!this._albumPickerOpen || !payload || payload.requestId !== this._albumPickerLoadRequestId) return;
+    this._albumPickerLoadRequestId = null;
+    this._setAlbumPickerBusy(false);
+    this._albumPickerAlbums = Array.isArray(payload.albums)
+      ? payload.albums.map((album) => ({
+          id: album && album.id != null ? String(album.id).trim() : '',
+          name: album && typeof album.name === 'string' ? album.name.trim() : ''
+        })).filter((album) => album.id && album.name)
+      : [];
+    this._albumPickerPreferCurrent = true;
+    if (payload.error) this._setAlbumPickerStatus(payload.error, true);
+    else this._setAlbumPickerStatus('', false);
+    this._renderAlbumPickerList();
+  },
+
+  _activateAlbumPickerItem(item) {
+    if (!item || this._albumPickerSelectionRequestId != null) return;
+    const requestId = ++this._albumPickerRequestSeq;
+    this._albumPickerSelectionRequestId = requestId;
+    this._setAlbumPickerBusy(true);
+    this._setAlbumPickerStatus(
+      item.type === 'rotation'
+        ? this.translate('ALBUM_PICKER_RESUMING')
+        : this.translate('ALBUM_PICKER_SELECTING') + item.name,
+      false
+    );
+    this._renderAlbumPickerList();
+    if (item.type === 'rotation') {
+      this.sendSocketNotification('IMMICH_TILES_RESUME_ALBUM_ROTATION', { requestId });
+    } else {
+      this.sendSocketNotification('IMMICH_TILES_SELECT_ALBUM', {
+        requestId,
+        albumId: item.id
+      });
+    }
+  },
+
+  _handleAlbumPickerError(payload) {
+    if (!payload) return;
+    const isLoadError = payload.requestId === this._albumPickerLoadRequestId;
+    const isSelectionError = payload.requestId === this._albumPickerSelectionRequestId;
+    if (!isLoadError && !isSelectionError) return;
+    if (isLoadError) this._albumPickerLoadRequestId = null;
+    if (isSelectionError) this._albumPickerSelectionRequestId = null;
+    this._setAlbumPickerBusy(false);
+    this._setAlbumPickerStatus(payload.message || this.translate('ALBUM_PICKER_REQUEST_FAILED'), true);
+    this._renderAlbumPickerList();
+  },
+
+  _handleAlbumPickerSelectionDone(payload) {
+    if (!payload || payload.requestId !== this._albumPickerSelectionRequestId) return;
+    this._activeAlbumPickerRequestId = payload.requestId;
+    this._albumPickerSelectionRequestId = null;
+    this._setAlbumPickerBusy(false);
+    this._closeAlbumPicker();
+  },
+
+  _shouldAcceptAlbumPickerMedia(payload) {
+    const expectedRequestId = this._albumPickerSelectionRequestId != null
+      ? this._albumPickerSelectionRequestId
+      : this._activeAlbumPickerRequestId;
+    if (expectedRequestId == null || (payload && payload.requestId === expectedRequestId)) return true;
+    this.log('ignoring stale album media response');
+    return false;
   },
 
   /**
@@ -1008,6 +1366,12 @@ Module.register("MMM-ImmichTileSlideShow", {
    */
   stop() {
     this._stopping = true;
+    if (this._albumPickerKeyHandler && typeof document !== "undefined" && typeof document.removeEventListener === "function") {
+      document.removeEventListener("keydown", this._albumPickerKeyHandler);
+    }
+    this._albumPickerKeyHandler = null;
+    this._albumPickerSelectionRequestId = null;
+    this._closeAlbumPicker(true);
     if (this._pendingHlsVideos) this._pendingHlsVideos.clear();
     if (this._rotationTimer) clearInterval(this._rotationTimer);
     if (this._featuredTimer) clearInterval(this._featuredTimer);
@@ -1033,6 +1397,11 @@ Module.register("MMM-ImmichTileSlideShow", {
     this._root = null;
     this._container = null;
     this._albumLabel = null;
+    this._albumPicker = null;
+    this._albumPickerSearch = null;
+    this._albumPickerStatus = null;
+    this._albumPickerList = null;
+    this._albumPickerCloseButton = null;
   },
 
   _setAlbumLabel(name) {

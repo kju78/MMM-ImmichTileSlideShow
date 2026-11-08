@@ -288,6 +288,14 @@ that is not yet cached is fetched through Immich, so its first appearance can
 wait on the network; later appearances use the local cache while the entry
 remains cached.
 
+### Keyboard album picker
+
+Press `A` to open the picker, type to filter the alphabetized album list, use
+the up/down arrows to move, `Enter` to choose, and `Esc` to close. Choosing an
+album keeps it selected and pauses automatic rotation. When
+`albumRotation.enabled` is true, choose **Automatic rotation** in the picker to
+resume the configured rotation.
+
 ```js
 config: {
   cache: {
