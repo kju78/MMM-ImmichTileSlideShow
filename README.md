@@ -292,9 +292,9 @@ remains cached.
 
 Press `A` to open the picker, type to filter the alphabetized album list, use
 the up/down arrows to move, `Enter` to choose, and `Esc` to close. Choosing an
-album keeps it selected and pauses automatic rotation. When
-`albumRotation.enabled` is true, choose **Automatic rotation** in the picker to
-resume the configured rotation.
+album pauses automatic rotation; the configured rotation resumes after one
+hour. When `albumRotation.enabled` is true, choose **Automatic rotation** in the
+picker to resume it sooner.
 
 ```js
 config: {

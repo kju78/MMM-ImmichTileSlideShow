@@ -71,7 +71,7 @@ test('lists all Immich albums alphabetically for the picker', async (t) => {
   assert.deepEqual(notifications[0].payload.albums.map((album) => album.name), ['Alpha', 'Bravo', 'Zeta']);
 });
 
-test('selects an album manually and can resume configured rotation', async (t) => {
+test('resumes configured rotation one hour after manual selection and can resume sooner', async (t) => {
   const keys = [
     'init',
     'getAlbumNameToIdMap',
@@ -95,7 +95,10 @@ test('selects an album manually and can resume configured rotation', async (t) =
     updatedAt: 'version-1'
   }];
   immichApi.init = async () => {};
-  immichApi.getAlbumNameToIdMap = async () => new Map([['Selected album', 'album-1']]);
+  immichApi.getAlbumNameToIdMap = async () => new Map([
+    ['Selected album', 'album-1'],
+    ['Another album', 'album-2']
+  ]);
   immichApi.getAlbumAssetsForAlbumIds = async (_albumIds, { onPage }) => {
     onPage(assets);
     return assets;
@@ -141,12 +144,30 @@ test('selects an album manually and can resume configured rotation', async (t) =
     }
   };
   const rotationTimer = context._albumRotationTimer;
-  t.after(() => clearTimeout(rotationTimer));
-
-  await nodeHelper.socketNotificationReceived.call(context, 'IMMICH_TILES_SELECT_ALBUM', {
-    requestId: 11,
-    albumId: 'album-1'
+  const manualTimers = [];
+  t.after(() => {
+    clearTimeout(rotationTimer);
+    for (const timer of manualTimers) clearTimeout(timer.handle);
   });
+
+  const originalSetTimeout = global.setTimeout;
+  global.setTimeout = (callback, delay, ...args) => {
+    const handle = originalSetTimeout(callback, delay, ...args);
+    if (delay === 60 * 60 * 1000) manualTimers.push({ callback, delay, handle });
+    return handle;
+  };
+  try {
+    await nodeHelper.socketNotificationReceived.call(context, 'IMMICH_TILES_SELECT_ALBUM', {
+      requestId: 11,
+      albumId: 'album-1'
+    });
+    await nodeHelper.socketNotificationReceived.call(context, 'IMMICH_TILES_SELECT_ALBUM', {
+      requestId: 13,
+      albumId: 'album-2'
+    });
+  } finally {
+    global.setTimeout = originalSetTimeout;
+  }
 
   assert.equal(context._albumRotationTimer, null);
   assert.equal(context._albumRotationState, null);
@@ -156,15 +177,30 @@ test('selects an album manually and can resume configured rotation', async (t) =
   assert.equal(notifications.some((item) =>
     item.notification === 'IMMICH_TILES_ALBUM_SELECTION_DONE' && item.payload.requestId === 11), true);
 
+  const nextManualData = notifications.find((item) =>
+    item.notification === 'IMMICH_TILES_DATA' && item.payload.requestId === 13);
+  assert.equal(nextManualData.payload.albumName, 'Another album');
+  assert.equal(manualTimers.length, 2);
+  assert.equal(manualTimers[0].delay, 60 * 60 * 1000);
+  assert.equal(manualTimers[1].delay, 60 * 60 * 1000);
+  assert.equal(context._manualAlbumResumeTimer, manualTimers[1].handle);
+
+  clearTimeout(manualTimers[1].handle);
+  await manualTimers[1].callback();
+  const automaticData = notifications.filter((item) =>
+    item.notification === 'IMMICH_TILES_DATA' && item.payload.requestId === 13).at(-1);
+  assert.equal(automaticData.payload.albumName, 'Selected album');
+  assert.equal(context._manualAlbumResumeTimer, null);
+
   await nodeHelper.socketNotificationReceived.call(context, 'IMMICH_TILES_RESUME_ALBUM_ROTATION', {
-    requestId: 12
+    requestId: 14
   });
 
   const rotationData = notifications.find((item) =>
-    item.notification === 'IMMICH_TILES_DATA' && item.payload.requestId === 12);
+    item.notification === 'IMMICH_TILES_DATA' && item.payload.requestId === 14);
   assert.equal(rotationData.payload.albumName, 'Selected album');
   assert.equal(notifications.some((item) =>
-    item.notification === 'IMMICH_TILES_ALBUM_SELECTION_DONE' && item.payload.requestId === 12), true);
+    item.notification === 'IMMICH_TILES_ALBUM_SELECTION_DONE' && item.payload.requestId === 14), true);
 });
 
 test('waits for the initial album cache before sending tiles to the frontend', async (t) => {

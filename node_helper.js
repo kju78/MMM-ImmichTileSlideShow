@@ -15,6 +15,7 @@ const fs = require("fs");
 
 const LOG_PREFIX = "MMM-ImmichTileSlideShow :: helper :: ";
 const ROTATION_RETRY_MS = 5 * 60 * 1000;
+const MANUAL_ALBUM_RESUME_DELAY_MS = 60 * 60 * 1000;
 
 function dlog(ctx, ...args) {
   if (ctx && ctx.config && ctx.config.debug) {
@@ -47,6 +48,8 @@ module.exports = NodeHelper.create({
     this._albumRotationTimer = null;
     this._albumRotationState = null;
     this._albumRotationGeneration = 0;
+    this._manualAlbumResumeTimer = null;
+    this._manualAlbumResumeGeneration = 0;
     Log.info(LOG_PREFIX + "started");
     try {
       // Ensure a PNG screenshot exists for README reference (generated locally)
@@ -337,11 +340,36 @@ async function _initializeImmich(context, cfg, force) {
   return immichApi;
 }
 
+function _cancelManualAlbumResume(context) {
+  context._manualAlbumResumeGeneration = (context._manualAlbumResumeGeneration || 0) + 1;
+  if (context._manualAlbumResumeTimer) clearTimeout(context._manualAlbumResumeTimer);
+  context._manualAlbumResumeTimer = null;
+}
+
 function _stopAlbumRotation(context) {
   context._albumRotationGeneration = (context._albumRotationGeneration || 0) + 1;
   if (context._albumRotationTimer) clearTimeout(context._albumRotationTimer);
   context._albumRotationTimer = null;
+  _cancelManualAlbumResume(context);
   context._albumRotationState = null;
+}
+
+function _scheduleManualAlbumResume(context, requestId) {
+  _cancelManualAlbumResume(context);
+  const rotation = context.config && context.config.albumRotation;
+  if (!rotation || !rotation.enabled) return;
+
+  const generation = context._manualAlbumResumeGeneration;
+  Log.info(LOG_PREFIX + 'Manual album selected; configured rotation will resume in 60 minutes.');
+  context._manualAlbumResumeTimer = setTimeout(() => {
+    if (context._manualAlbumResumeGeneration !== generation) return;
+    context._manualAlbumResumeTimer = null;
+    Log.info(LOG_PREFIX + 'Manual album display ended; resuming configured album rotation.');
+    _stopAlbumRotation(context);
+    return _startAlbumRotation(context, requestId).catch((error) => {
+      Log.error(LOG_PREFIX + 'Could not resume album rotation after manual selection: ' + error.message);
+    });
+  }, MANUAL_ALBUM_RESUME_DELAY_MS);
 }
 
 async function _resolveRotationAlbums(context, cfg, immichApi) {
@@ -586,6 +614,7 @@ async function _selectAlbum(context, payload) {
   });
   if (!tiles.length) throw new Error(`Album "${album.name}" returned no supported media.`);
   _setCacheProtection(immichApi, tiles);
+  _scheduleManualAlbumResume(context, requestId);
   context.sendSocketNotification('IMMICH_TILES_ALBUM_SELECTION_DONE', {
     requestId,
     albumName: album.name
