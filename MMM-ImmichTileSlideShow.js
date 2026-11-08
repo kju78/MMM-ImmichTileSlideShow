@@ -7,7 +7,9 @@
  * Defaults render with placeholder tiles so it works with zero config.
  */
 
-/* global Module, Log, MMMITSSConfig */
+/* global Module, Log, MMMITSSConfig, Hls */
+
+const IMMICH_HLS_PROXY_URL = '/immichtilesslideshow-hls/';
 
 /**
  * @typedef {Object} TileImage
@@ -17,6 +19,7 @@
  * @property {string} [posterSrc] - Poster image for videos
  * @property {string} [takenAt]
  * @property {string} [albumName]
+ * @property {string} [assetId]
  */
 
 Module.register("MMM-ImmichTileSlideShow", {
@@ -93,7 +96,10 @@ Module.register("MMM-ImmichTileSlideShow", {
    * @returns {string[]}
    */
   getScripts() {
-    return [this.file("configSchema.js")];
+    return [
+      this.file("configSchema.js"),
+      this.file("node_modules/hls.js/dist/hls.min.js")
+    ];
   },
 
   /**
@@ -130,6 +136,9 @@ Module.register("MMM-ImmichTileSlideShow", {
     this._nextVideoIndex = 0;
     this._started = false;
     this._activeVideos = new Set();
+    this._hlsPlayers = new Map();
+    this._pendingHlsVideos = new Map();
+    this._stopping = false;
     this._imagePool = [];
     this._videoPool = [];
     this._cadenceIndex = 0;
@@ -611,25 +620,65 @@ Module.register("MMM-ImmichTileSlideShow", {
     tile.dataset.mmmitssTransitionToken = String(transitionToken);
     tile.classList.remove('swap', 'swap-in', 'swap-out');
 
-    if (animate && this.cfg.transition === 'fade' && previousSrc && sourceChanged) {
-      this._fadeTileToMedia(tile, image, transitionToken);
+    const apply = () => {
+      if (tile.dataset.mmmitssTransitionToken !== String(transitionToken)) return;
+      if (animate && this.cfg.transition === 'fade' && previousSrc && sourceChanged) {
+        this._fadeTileToMedia(tile, image, transitionToken);
+        return;
+      }
+
+      this._applyTileContent(tile, image);
+      tile.dataset.mmmitssMediaSrc = nextSrc;
+      this._applyMosaicSpans(tile, image);
+
+      if (!animate || !sourceChanged) return;
+      if (this.cfg.transition === 'fade') {
+        this._fadeTileIn(tile, transitionToken, Number(this.cfg.transitionMs) || 0);
+      } else {
+        void tile.offsetWidth;
+        tile.classList.add('swap');
+        setTimeout(() => {
+          if (tile.dataset.mmmitssTransitionToken === String(transitionToken)) tile.classList.remove('swap');
+        }, Math.max(200, this.cfg.transitionMs));
+      }
+    };
+
+    const preloadSrc = image.kind === 'video'
+      ? (this.cfg.videos.enabled ? image.posterSrc : null)
+      : image.src;
+    if (sourceChanged && preloadSrc) {
+      this._preloadTileImage(preloadSrc).then(apply).catch((error) => {
+        if (tile.dataset.mmmitssTransitionToken !== String(transitionToken)) return;
+        this.log('image preload failed:', error && error.message ? error.message : String(error));
+      });
       return;
     }
 
-    this._applyTileContent(tile, image);
-    tile.dataset.mmmitssMediaSrc = nextSrc;
-    this._applyMosaicSpans(tile, image);
+    apply();
+  },
 
-    if (!animate || !sourceChanged) return;
-    if (this.cfg.transition === 'fade') {
-      this._fadeTileIn(tile, transitionToken, Number(this.cfg.transitionMs) || 0);
-    } else {
-      void tile.offsetWidth;
-      tile.classList.add('swap');
-      setTimeout(() => {
-        if (tile.dataset.mmmitssTransitionToken === String(transitionToken)) tile.classList.remove('swap');
-      }, Math.max(200, this.cfg.transitionMs));
-    }
+  _preloadTileImage(src) {
+    return new Promise((resolve, reject) => {
+      if (typeof Image === 'undefined') {
+        reject(new Error('Image constructor is unavailable.'));
+        return;
+      }
+
+      const image = new Image();
+      if (typeof image.decode === 'function') {
+        image.src = src;
+        image.decode().then(resolve, reject);
+        return;
+      }
+
+      image.onload = resolve;
+      image.onerror = () => reject(new Error(`Failed to load image: ${src}`));
+      image.src = src;
+      if (image.complete) {
+        if (image.naturalWidth > 0) resolve();
+        else reject(new Error(`Failed to load image: ${src}`));
+      }
+    });
   },
 
   _fadeTileToMedia(tile, image, transitionToken) {
@@ -663,11 +712,14 @@ Module.register("MMM-ImmichTileSlideShow", {
     const imgEl = tile.querySelector(".immich-tile-img");
     let vidEl = tile.querySelector("video.immich-tile-video");
     const capEl = tile.querySelector(".immich-tile-caption");
+    let hlsSlotFreed = false;
     if (!imgEl || !capEl) return;
 
     // Tear down any prior video element if switching kinds
     if (vidEl && (image.kind !== 'video' || !this.cfg.videos.enabled)) {
-      this._activeVideos.delete(vidEl);
+      if (this._pendingHlsVideos) this._pendingHlsVideos.delete(vidEl);
+      hlsSlotFreed = this._activeVideos.delete(vidEl);
+      this._disposeHlsPlayer(vidEl);
       try {
         vidEl.pause();
         vidEl.removeAttribute('src');
@@ -675,6 +727,7 @@ Module.register("MMM-ImmichTileSlideShow", {
       } catch (e) {}
       vidEl.remove();
       vidEl = null;
+      if (hlsSlotFreed && this.cfg.videos.playbackMode === 'hls') this._startNextHlsVideo();
     }
 
     if (image.kind === 'video' && this.cfg.videos.enabled) {
@@ -687,9 +740,29 @@ Module.register("MMM-ImmichTileSlideShow", {
         vidEl.autoplay = false;
         vidEl.preload = String(this.cfg.videos.preload || 'metadata');
         const videoElement = vidEl;
-        const releaseVideo = () => this._activeVideos.delete(videoElement);
+        const releaseVideo = () => {
+          const wasActive = this._activeVideos.delete(videoElement);
+          if (wasActive && this.cfg.videos.playbackMode === 'hls') {
+            this._disposeHlsPlayer(videoElement);
+            this._startNextHlsVideo();
+          }
+        };
         vidEl.addEventListener('ended', releaseVideo);
         vidEl.addEventListener('pause', releaseVideo);
+        vidEl.addEventListener('error', () => {
+          const wasActive = this._activeVideos.delete(videoElement);
+          videoElement.style.display = 'none';
+          const mediaError = videoElement.error;
+          const detail = mediaError
+            ? `MediaError ${mediaError.code}${mediaError.message ? `: ${mediaError.message}` : ''}`
+            : 'unknown MediaError';
+          this.log('video playback failed:', videoElement.currentSrc || videoElement.src, detail);
+          if (this.cfg.videos.playbackMode === 'hls') {
+            if (this._pendingHlsVideos) this._pendingHlsVideos.delete(videoElement);
+            this._disposeHlsPlayer(videoElement);
+            if (wasActive) this._startNextHlsVideo();
+          }
+        });
         // place into media container
         const media = tile.querySelector('.immich-tile-media') || tile;
         media.appendChild(vidEl);
@@ -697,33 +770,33 @@ Module.register("MMM-ImmichTileSlideShow", {
       // set sources/poster
       if (image.posterSrc) vidEl.poster = image.posterSrc;
       else vidEl.removeAttribute('poster');
-      if (vidEl.getAttribute('src') !== image.src) {
-        if (!vidEl.paused) vidEl.pause();
+      const hlsState = this._hlsPlayers && this._hlsPlayers.get(vidEl);
+      const pendingHlsImage = this._pendingHlsVideos && this._pendingHlsVideos.get(vidEl);
+      const currentSource = hlsState
+        ? hlsState.source
+        : pendingHlsImage
+          ? pendingHlsImage.src
+          : vidEl.getAttribute('src');
+      if (currentSource !== image.src) {
+        if (this._pendingHlsVideos) this._pendingHlsVideos.delete(vidEl);
         this._activeVideos.delete(vidEl);
-        vidEl.src = image.src;
+        this._disposeHlsPlayer(vidEl);
+        if (!vidEl.paused) vidEl.pause();
+        vidEl.style.display = '';
+        if (this.cfg.videos.playbackMode === 'hls') {
+          if (vidEl.hasAttribute && vidEl.hasAttribute('src')) {
+            vidEl.removeAttribute('src');
+            vidEl.load();
+          }
+          this._queueHlsVideo(vidEl, image);
+        } else {
+          vidEl.src = image.src;
+        }
       }
       // hide the background image layer
       imgEl.style.backgroundImage = image.posterSrc ? `url('${image.posterSrc}')` : '';
-      // Play with concurrency guard
-      const maxConcurrent = Math.max(0, Number(this.cfg.videos.maxConcurrent) || 0);
-      if (
-        this.cfg.videos.autoplay &&
-        !this._activeVideos.has(vidEl) &&
-        this._activeVideos.size < maxConcurrent
-      ) {
-        this._activeVideos.add(vidEl);
-        try {
-          const playback = vidEl.play();
-          if (playback && typeof playback.catch === 'function') {
-            playback.catch((error) => {
-              this._activeVideos.delete(vidEl);
-              this.log('video playback rejected:', error.message);
-            });
-          }
-        } catch (error) {
-          this._activeVideos.delete(vidEl);
-          this.log('video playback rejected:', error.message);
-        }
+      if (this.cfg.videos.playbackMode !== 'hls') {
+        this._startVideoPlayback(vidEl);
       }
     } else {
       // Image mode: set background-image and remove any video
@@ -745,6 +818,168 @@ Module.register("MMM-ImmichTileSlideShow", {
       capEl.style.display = "none";
     }
 
+  },
+
+  _queueHlsVideo(videoElement, image) {
+    if (!this.cfg.videos.autoplay || Number(this.cfg.videos.maxConcurrent) <= 0) return;
+    if (!this._pendingHlsVideos) this._pendingHlsVideos = new Map();
+    this._pendingHlsVideos.set(videoElement, image);
+    this._startNextHlsVideo();
+  },
+
+  _startNextHlsVideo() {
+    if (
+      this._stopping ||
+      !this.cfg.videos.autoplay ||
+      this.cfg.videos.playbackMode !== 'hls' ||
+      !this._pendingHlsVideos
+    ) {
+      return;
+    }
+    const maxConcurrent = Math.max(0, Number(this.cfg.videos.maxConcurrent) || 0);
+    while (this._activeVideos.size < maxConcurrent && this._pendingHlsVideos.size) {
+      const [videoElement, image] = this._pendingHlsVideos.entries().next().value;
+      this._pendingHlsVideos.delete(videoElement);
+      this._activeVideos.add(videoElement);
+      if (!this._attachHlsPlayer(videoElement, image)) this._activeVideos.delete(videoElement);
+    }
+  },
+
+  _startVideoPlayback(videoElement) {
+    const maxConcurrent = Math.max(0, Number(this.cfg.videos.maxConcurrent) || 0);
+    if (
+      this.cfg.videos.autoplay &&
+      !this._activeVideos.has(videoElement) &&
+      this._activeVideos.size < maxConcurrent
+    ) {
+      this._activeVideos.add(videoElement);
+      this._playReservedVideo(videoElement);
+    }
+  },
+
+  _playReservedVideo(videoElement) {
+    if (!this._activeVideos.has(videoElement)) return;
+    try {
+      const playback = videoElement.play();
+      if (playback && typeof playback.catch === 'function') {
+        playback.catch((error) => {
+          const isHlsPlayer = this._hlsPlayers && this._hlsPlayers.has(videoElement);
+          this._activeVideos.delete(videoElement);
+          this.log('video playback rejected:', error.message);
+          if (isHlsPlayer) {
+            this._disposeHlsPlayer(videoElement);
+            this._startNextHlsVideo();
+          }
+        });
+      }
+    } catch (error) {
+      const isHlsPlayer = this._hlsPlayers && this._hlsPlayers.has(videoElement);
+      this._activeVideos.delete(videoElement);
+      this.log('video playback rejected:', error.message);
+      if (isHlsPlayer) {
+        this._disposeHlsPlayer(videoElement);
+        this._startNextHlsVideo();
+      }
+    }
+  },
+
+  _attachHlsPlayer(videoElement, image) {
+    const HlsClass = typeof Hls === 'undefined' ? null : Hls;
+    if (!HlsClass || typeof HlsClass.isSupported !== 'function' || !HlsClass.isSupported()) {
+      videoElement.style.display = 'none';
+      this.log('HLS playback unavailable: hls.js is missing or Media Source Extensions are unsupported.');
+      return false;
+    }
+
+    const state = {
+      player: null,
+      source: image.src,
+      assetId: image.assetId,
+      sessionId: null,
+      lastSegmentIndex: null
+    };
+    let player;
+    try {
+      player = new HlsClass({
+        xhrSetup: (xhr, url) => {
+          if (/\/playlist\.m3u8(?:[?#]|$)/.test(String(url)) && Number.isFinite(videoElement.currentTime)) {
+            xhr.setRequestHeader('x-immich-hls-position', String(Math.max(0, videoElement.currentTime)));
+          }
+          if (
+            String(url).match(/\/init\.mp4(?:[?#]|$)/) &&
+            Number.isSafeInteger(state.lastSegmentIndex) &&
+            state.lastSegmentIndex >= 0
+          ) {
+            xhr.setRequestHeader('x-immich-hls-init-segment', String(state.lastSegmentIndex));
+          }
+        }
+      });
+    } catch (error) {
+      videoElement.style.display = 'none';
+      this.log('HLS player initialization failed:', error.message);
+      return false;
+    }
+    state.player = player;
+    if (!this._hlsPlayers) this._hlsPlayers = new Map();
+    this._hlsPlayers.set(videoElement, state);
+
+    player.on(HlsClass.Events.LEVEL_LOADING, (_event, data) => {
+      const match = String(data && data.url || '').match(
+        /\/immichtilesslideshow-hls\/[^/]+\/([0-9a-f-]{36})\/\d+\/playlist\.m3u8(?:[?#]|$)/i
+      );
+      if (match) state.sessionId = match[1];
+    });
+    player.on(HlsClass.Events.FRAG_LOADING, (_event, data) => {
+      const segmentIndex = Number(data && data.frag && data.frag.sn);
+      if (Number.isSafeInteger(segmentIndex) && segmentIndex >= 0) state.lastSegmentIndex = segmentIndex;
+    });
+    player.on(HlsClass.Events.MANIFEST_PARSED, () => {
+      if (this._hlsPlayers.get(videoElement) === state) this._playReservedVideo(videoElement);
+    });
+    player.on(HlsClass.Events.ERROR, (_event, data) => {
+      if (!data || !data.fatal) return;
+      const wasActive = this._activeVideos.delete(videoElement);
+      videoElement.style.display = 'none';
+      if (this._pendingHlsVideos) this._pendingHlsVideos.delete(videoElement);
+      this.log(
+        'HLS playback failed:',
+        state.source,
+        `type=${data.type || 'unknown'}`,
+        `details=${data.details || 'unknown'}`
+      );
+      this._disposeHlsPlayer(videoElement);
+      if (wasActive) this._startNextHlsVideo();
+    });
+    try {
+      player.loadSource(image.src);
+      player.attachMedia(videoElement);
+    } catch (error) {
+      videoElement.style.display = 'none';
+      this.log('HLS player initialization failed:', error.message);
+      this._disposeHlsPlayer(videoElement);
+      return false;
+    }
+    return true;
+  },
+
+  _disposeHlsPlayer(videoElement) {
+    if (!this._hlsPlayers) return;
+    const state = this._hlsPlayers.get(videoElement);
+    if (!state) return;
+    this._hlsPlayers.delete(videoElement);
+    try {
+      state.player.destroy();
+    } catch (error) {
+      this.log('HLS player cleanup failed:', error.message);
+    }
+    if (state.assetId && state.sessionId && typeof fetch === 'function') {
+      fetch(
+        `${IMMICH_HLS_PROXY_URL}${encodeURIComponent(state.assetId)}/${encodeURIComponent(state.sessionId)}`,
+        { method: 'DELETE', keepalive: true }
+      ).catch((error) => {
+        this.log('HLS session cleanup failed:', error.message);
+      });
+    }
   },
 
   /**
@@ -772,6 +1007,8 @@ Module.register("MMM-ImmichTileSlideShow", {
    * Stop lifecycle hook to clear timers
    */
   stop() {
+    this._stopping = true;
+    if (this._pendingHlsVideos) this._pendingHlsVideos.clear();
     if (this._rotationTimer) clearInterval(this._rotationTimer);
     if (this._featuredTimer) clearInterval(this._featuredTimer);
     if (this._mmObserver) {
@@ -782,6 +1019,9 @@ Module.register("MMM-ImmichTileSlideShow", {
       try { video.pause(); } catch (e) {}
     }
     this._activeVideos.clear();
+    if (this._hlsPlayers) {
+      for (const video of this._hlsPlayers.keys()) this._disposeHlsPlayer(video);
+    }
     this._unbindResize();
     if (this._sizeCacheTimer) { try { clearInterval(this._sizeCacheTimer); } catch (_) {} this._sizeCacheTimer = null; }
     // Remove injected root to avoid leakage on restarts

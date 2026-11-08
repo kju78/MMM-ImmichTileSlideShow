@@ -6,12 +6,27 @@ const axios = require('axios');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-// http-proxy-middleware no longer used; custom routes stream with fallback
+// http-proxy-middleware no longer used; custom routes handle caching and fallbacks
 
 const PreviewCache = require('./previewCache');
 const LOG_PREFIX = 'MMM-ImmichTileSlideShow :: immichApi :: ';
 const IMMICH_PROXY_URL = '/immichtilesslideshow/';
 const IMMICH_VIDEO_PROXY_URL = '/immichtilesslideshow-video/';
+const IMMICH_HLS_PROXY_URL = '/immichtilesslideshow-hls/';
+const HLS_PLAYLIST_CONTENT_TYPE = 'application/vnd.apple.mpegurl';
+const HLS_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const HLS_SEGMENT_FILENAME_PATTERN = /^(?:init\.mp4|seg_\d+\.m4s)$/;
+
+function hlsErrorStatus(error) {
+  const status = Number(error && error.response && error.response.status);
+  return Number.isInteger(status) && status >= 400 && status < 500 ? status : 502;
+}
+
+function hlsErrorDetail(error) {
+  const responseData = error && error.response && error.response.data;
+  const detail = typeof responseData === 'string' ? responseData : (error && error.message) || 'unknown error';
+  return String(detail).replace(/\s+/g, ' ').slice(0, 240);
+}
 
 function isCacheableVideoContentType(contentType) {
   const mediaType = String(contentType || '').split(';', 1)[0].trim().toLowerCase();
@@ -92,6 +107,7 @@ const immichApi = {
       serverInfoUrl: '/server/version',
       search: '/search/smart',
       randomSearch: '/search/random',
+      videoHlsStream: '/assets/{id}/video/stream/main.m3u8',
       videoStream: '/assets/{id}/video/playback' // v3: /video -> /video/playback
     }
   },
@@ -100,6 +116,9 @@ const immichApi = {
   apiBaseUrl: '/api',
   http: null,
   preferThumbnail: false,
+  videoFallbackToOriginal: true,
+  videoPlaybackMode: 'playback',
+  videoCacheVariant: 'video',
   previewCache: null,
   videoCache: null,
   _previewRequests: new Map(),
@@ -114,6 +133,9 @@ const immichApi = {
   init: async function (config, expressApp, force) {
     if (this.http === null || force) {
       this.preferThumbnail = !!config.preferThumbnail;
+      this.videoFallbackToOriginal = !config.videos || config.videos.fallbackToOriginal !== false;
+      this.videoPlaybackMode = config.videos && config.videos.playbackMode === 'hls' ? 'hls' : 'playback';
+      this.videoCacheVariant = this.videoFallbackToOriginal ? 'video' : 'playback-only';
       const cacheConfig = config.cache || {};
       if (cacheConfig.enabled) {
         const directory = cacheConfig.directory || path.join(os.homedir(), '.cache', 'MMM-ImmichTileSlideShow');
@@ -133,7 +155,13 @@ const immichApi = {
         await this.previewCache.initialize();
 
         const videoMaxBytes = Number(cacheConfig.videoMaxBytes);
-        if (config.videos && config.videos.enabled === true && Number.isSafeInteger(videoMaxBytes) && videoMaxBytes > 0) {
+        if (
+          this.videoPlaybackMode !== 'hls' &&
+          config.videos &&
+          config.videos.enabled === true &&
+          Number.isSafeInteger(videoMaxBytes) &&
+          videoMaxBytes > 0
+        ) {
           const videoDirectory = path.join(path.resolve(directory), 'videos');
           if (
             !this.videoCache ||
@@ -303,7 +331,7 @@ const immichApi = {
           const assetVersion = typeof req.query.v === 'string' ? req.query.v : '';
           if (this.videoCache) {
             try {
-              const cached = await this.videoCache.get(assetId, assetVersion, 'video');
+              const cached = await this.videoCache.get(assetId, assetVersion, this.videoCacheVariant || 'video');
               if (cached) {
                 const sendError = await new Promise((resolve) => {
                   res.sendFile(cached.filePath, {
@@ -330,7 +358,14 @@ const immichApi = {
           const urls = [];
           const conf = this.apiUrls[this.apiLevel];
           if (conf.videoStream) urls.push(conf.videoStream.replace('{id}', assetId));
-          if (conf.assetOriginal) urls.push(conf.assetOriginal.replace('{id}', assetId));
+          if (this.videoFallbackToOriginal && conf.assetOriginal) {
+            urls.push(conf.assetOriginal.replace('{id}', assetId));
+          }
+          if (!urls.length) {
+            Log.error(LOG_PREFIX + `No Immich video playback endpoint is available for asset ${assetId}.`);
+            res.status(502).end();
+            return;
+          }
           for (let i = 0; i < urls.length; i++) {
             const p = urls[i];
             try {
@@ -346,16 +381,28 @@ const immichApi = {
                 }
                 res.status(upstream.status);
                 if (upstream.status === 304) { res.end(); return; }
-                upstream.data.on('error', () => { try { res.end(); } catch (_) {} });
+                upstream.data.on('error', (error) => {
+                  if (!req.aborted && !res.destroyed) {
+                    Log.warn(LOG_PREFIX + `video playback stream failed for asset ${assetId}: ${error.message}`);
+                  }
+                  try { res.end(); } catch (_) {}
+                });
                 upstream.data.pipe(res);
                 return;
               }
-              if (upstream.status === 404 && i < urls.length - 1) continue;
+              if (upstream.data && typeof upstream.data.destroy === 'function') upstream.data.destroy();
+              if (upstream.status === 404 && i < urls.length - 1) {
+                if (this.debugOn) {
+                  Log.warn(LOG_PREFIX + `video playback returned 404 for asset ${assetId}; trying the configured original fallback.`);
+                }
+                continue;
+              }
+              Log.warn(LOG_PREFIX + `video playback failed for asset ${assetId}: Immich returned ${upstream.status} ${upstream.statusText || ''}${this.videoFallbackToOriginal ? '' : ' (original-file fallback is disabled)'}.`);
               res.status(upstream.status).end();
               return;
             } catch (e) {
               if (i < urls.length - 1) continue;
-              Log.warn(LOG_PREFIX + 'video route error: ' + e.message);
+              Log.warn(LOG_PREFIX + `video playback failed for asset ${assetId}: ${e.message}${this.videoFallbackToOriginal ? '' : ' (original-file fallback is disabled)'}.`);
               res.status(502).end();
               return;
             }
@@ -363,6 +410,169 @@ const immichApi = {
         });
         this._videoProxySetup = true;
       }
+
+      if (!this._hlsProxySetup) {
+        if (this.debugOn) Log.info(LOG_PREFIX + '[debug] setting up HLS routes at ' + IMMICH_HLS_PROXY_URL);
+
+        expressApp.get(IMMICH_HLS_PROXY_URL + ':id/main.m3u8', async (req, res) => {
+          const assetId = req.params.id;
+          res.setHeader('Cache-Control', 'no-store');
+          if (!HLS_UUID_PATTERN.test(assetId)) {
+            res.status(400).end();
+            return;
+          }
+          const conf = this.apiUrls[this.apiLevel];
+          if (!conf.videoHlsStream) {
+            Log.error(LOG_PREFIX + `HLS playback requires Immich v3 or newer (asset ${assetId}).`);
+            res.status(501).end();
+            return;
+          }
+          try {
+            const upstream = await this.http.get(conf.videoHlsStream.replace('{id}', assetId), {
+              responseType: 'text',
+              headers: { Accept: HLS_PLAYLIST_CONTENT_TYPE }
+            });
+            if (upstream.status !== 200) {
+              const detail = typeof upstream.data === 'string'
+                ? `: ${upstream.data.replace(/\s+/g, ' ').slice(0, 240)}`
+                : '';
+              Log.warn(LOG_PREFIX + `HLS playlist failed for asset ${assetId}: Immich returned ${upstream.status} ${upstream.statusText || ''}${detail}.`);
+              res.status(upstream.status).end();
+              return;
+            }
+            res.setHeader('Content-Type', upstream.headers['content-type'] || HLS_PLAYLIST_CONTENT_TYPE);
+            res.status(upstream.status).end(upstream.data);
+          } catch (error) {
+            Log.warn(LOG_PREFIX + `HLS playlist failed for asset ${assetId}: ${hlsErrorDetail(error)}.`);
+            res.status(hlsErrorStatus(error)).end();
+          }
+        });
+
+        expressApp.get(IMMICH_HLS_PROXY_URL + ':id/:sessionId/:variantIndex/playlist.m3u8', async (req, res) => {
+          const { id: assetId, sessionId } = req.params;
+          const variantIndex = Number(req.params.variantIndex);
+          res.setHeader('Cache-Control', 'no-store');
+          if (
+            !HLS_UUID_PATTERN.test(assetId) ||
+            !HLS_UUID_PATTERN.test(sessionId) ||
+            !Number.isSafeInteger(variantIndex) ||
+            variantIndex < 0
+          ) {
+            res.status(400).end();
+            return;
+          }
+          if (this.apiLevel !== 'v3_0') {
+            Log.error(LOG_PREFIX + `HLS playlist requested for asset ${assetId}, but Immich v3 is required.`);
+            res.status(501).end();
+            return;
+          }
+          const headers = { Accept: HLS_PLAYLIST_CONTENT_TYPE };
+          const position = req.headers['x-immich-hls-position'];
+          if (position !== undefined && Number.isFinite(Number(position)) && Number(position) >= 0) {
+            headers['x-immich-hls-position'] = String(Number(position));
+          }
+          try {
+            const upstream = await this.http.get(
+              `/assets/${assetId}/video/stream/${sessionId}/${variantIndex}/playlist.m3u8`,
+              { responseType: 'text', headers }
+            );
+            if (upstream.status !== 200) {
+              Log.warn(LOG_PREFIX + `HLS media playlist failed for asset ${assetId}: Immich returned ${upstream.status} ${upstream.statusText || ''}.`);
+              res.status(upstream.status).end();
+              return;
+            }
+            res.setHeader('Content-Type', upstream.headers['content-type'] || HLS_PLAYLIST_CONTENT_TYPE);
+            res.status(upstream.status).end(upstream.data);
+          } catch (error) {
+            Log.warn(LOG_PREFIX + `HLS media playlist failed for asset ${assetId}: ${hlsErrorDetail(error)}.`);
+            res.status(hlsErrorStatus(error)).end();
+          }
+        });
+
+        expressApp.get(IMMICH_HLS_PROXY_URL + ':id/:sessionId/:variantIndex/:filename', async (req, res) => {
+          const { id: assetId, sessionId, filename } = req.params;
+          const variantIndex = Number(req.params.variantIndex);
+          res.setHeader('Cache-Control', 'no-store');
+          if (
+            !HLS_UUID_PATTERN.test(assetId) ||
+            !HLS_UUID_PATTERN.test(sessionId) ||
+            !Number.isSafeInteger(variantIndex) ||
+            variantIndex < 0 ||
+            !HLS_SEGMENT_FILENAME_PATTERN.test(filename)
+          ) {
+            res.status(400).end();
+            return;
+          }
+          if (this.apiLevel !== 'v3_0') {
+            Log.error(LOG_PREFIX + `HLS segment requested for asset ${assetId}, but Immich v3 is required.`);
+            res.status(501).end();
+            return;
+          }
+          const headers = { Accept: req.headers['accept'] || '*/*' };
+          if (req.headers.range) headers.Range = req.headers.range;
+          const initSegment = req.headers['x-immich-hls-init-segment'];
+          if (initSegment !== undefined && Number.isSafeInteger(Number(initSegment)) && Number(initSegment) >= 0) {
+            headers['x-immich-hls-init-segment'] = String(Number(initSegment));
+          }
+          try {
+            const upstream = await this.http.get(
+              `/assets/${assetId}/video/stream/${sessionId}/${variantIndex}/${filename}`,
+              { responseType: 'stream', headers }
+            );
+            if (upstream.status < 200 || upstream.status >= 300) {
+              Log.warn(LOG_PREFIX + `HLS segment failed for asset ${assetId}: Immich returned ${upstream.status} ${upstream.statusText || ''}.`);
+              if (upstream.data && typeof upstream.data.destroy === 'function') upstream.data.destroy();
+              res.status(upstream.status).end();
+              return;
+            }
+            for (const name of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag']) {
+              const value = upstream.headers && upstream.headers[name];
+              if (typeof value !== 'undefined' && value !== null) res.setHeader(name, value);
+            }
+            res.status(upstream.status);
+            upstream.data.on('error', (error) => {
+              if (!req.aborted && !res.destroyed) {
+                Log.warn(LOG_PREFIX + `HLS segment stream failed for asset ${assetId}: ${error.message}`);
+              }
+              try { res.end(); } catch (_) {}
+            });
+            upstream.data.pipe(res);
+          } catch (error) {
+            Log.warn(LOG_PREFIX + `HLS segment failed for asset ${assetId}: ${hlsErrorDetail(error)}.`);
+            res.status(hlsErrorStatus(error)).end();
+          }
+        });
+
+        expressApp.delete(IMMICH_HLS_PROXY_URL + ':id/:sessionId', async (req, res) => {
+          const { id: assetId, sessionId } = req.params;
+          if (!HLS_UUID_PATTERN.test(assetId) || !HLS_UUID_PATTERN.test(sessionId)) {
+            res.status(400).end();
+            return;
+          }
+          if (this.apiLevel !== 'v3_0') {
+            res.status(501).end();
+            return;
+          }
+          try {
+            const upstream = await this.http.delete(`/assets/${assetId}/video/stream/${sessionId}`);
+            if (upstream.status === 404) {
+              res.status(204).end();
+              return;
+            }
+            if (upstream.status < 200 || upstream.status >= 300) {
+              Log.warn(LOG_PREFIX + `HLS session cleanup failed for asset ${assetId}: Immich returned ${upstream.status} ${upstream.statusText || ''}.`);
+              res.status(upstream.status).end();
+              return;
+            }
+            res.status(204).end();
+          } catch (error) {
+            Log.warn(LOG_PREFIX + `HLS session cleanup failed for asset ${assetId}: ${hlsErrorDetail(error)}.`);
+            res.status(hlsErrorStatus(error)).end();
+          }
+        });
+        this._hlsProxySetup = true;
+      }
+
       if (this.debugOn) Log.info(LOG_PREFIX + '[debug] Server API level -> ' + this.apiLevel);
       else Log.debug(LOG_PREFIX + 'Server API level -> ' + this.apiLevel);
     }
@@ -677,23 +887,30 @@ const immichApi = {
   },
 
   async _prefetchVideo(assetId, version) {
-    if (!this.videoCache) return null;
+    if (!this.videoCache || this.videoPlaybackMode === 'hls') return null;
     const cache = this.videoCache;
-    const cached = await cache.get(assetId, version, 'video');
+    const videoCacheVariant = this.videoCacheVariant || 'video';
+    const cached = await cache.get(assetId, version, videoCacheVariant);
     if (cached) return cached;
 
-    const key = cache.key(assetId, version, 'video');
+    const key = cache.key(assetId, version, videoCacheVariant);
     const existingRequest = this._videoRequests.get(key);
     if (existingRequest) return existingRequest;
 
     const request = cache.runLimited(async () => {
-      const secondCheck = await cache.get(assetId, version, 'video');
+      const secondCheck = await cache.get(assetId, version, videoCacheVariant);
       if (secondCheck) return secondCheck;
 
       const conf = this.apiUrls[this.apiLevel];
       const urls = [];
       if (conf.videoStream) urls.push(conf.videoStream.replace('{id}', assetId));
-      if (conf.assetOriginal) urls.push(conf.assetOriginal.replace('{id}', assetId));
+      if (this.videoFallbackToOriginal && conf.assetOriginal) {
+        urls.push(conf.assetOriginal.replace('{id}', assetId));
+      }
+      if (!urls.length) {
+        Log.error(LOG_PREFIX + `No Immich video playback endpoint is available for asset ${assetId}.`);
+        return null;
+      }
 
       for (let index = 0; index < urls.length; index++) {
         let upstream;
@@ -704,7 +921,7 @@ const immichApi = {
           });
         } catch (error) {
           if (index < urls.length - 1) continue;
-          Log.warn(LOG_PREFIX + 'video prefetch failed: ' + error.message);
+          Log.warn(LOG_PREFIX + `video playback prefetch failed for asset ${assetId}: ${error.message}${this.videoFallbackToOriginal ? '' : ' (original-file fallback is disabled)'}.`);
           return null;
         }
 
@@ -716,7 +933,7 @@ const immichApi = {
           isCacheableVideoContentType(contentType)
         ) {
           try {
-            return await cache.store(assetId, version, 'video', upstream.data, {
+            return await cache.store(assetId, version, videoCacheVariant, upstream.data, {
               contentType,
               etag: headers.etag,
               contentLength: headers['content-length']
@@ -732,11 +949,7 @@ const immichApi = {
         if (index < urls.length - 1 && (upstream.status === 404 || upstream.status === 410 || partialResponse)) {
           continue;
         }
-        if (upstream.status !== 404 && upstream.status !== 410) {
-          Log.warn(LOG_PREFIX + `video prefetch skipped a non-cacheable response (${upstream.status}, ${contentType}).`);
-        } else if (this.debugOn) {
-          Log.warn(LOG_PREFIX + `video prefetch skipped a missing asset (${upstream.status}).`);
-        }
+        Log.warn(LOG_PREFIX + `video playback response was not cached for asset ${assetId} (${upstream.status}, ${contentType})${this.videoFallbackToOriginal ? '' : '; original-file fallback is disabled'}.`);
         return null;
       }
       return null;
@@ -767,7 +980,8 @@ const immichApi = {
 
     if (this.previewCache) this.previewCache.addProtectedAssets(previews);
     if (this.videoCache) {
-      this.videoCache.addProtectedAssets(videos.map((tile) => ({ ...tile, cacheVariant: 'video' })));
+      const videoCacheVariant = this.videoCacheVariant || 'video';
+      this.videoCache.addProtectedAssets(videos.map((tile) => ({ ...tile, cacheVariant: videoCacheVariant })));
     }
     const workTiles = candidates.filter((tile) =>
       (this.previewCache && (tile.kind !== 'video' || Boolean(tile.posterSrc))) ||
@@ -822,6 +1036,9 @@ const immichApi = {
   },
 
   getVideoLink: function (imageId, version) {
+    if (this.videoPlaybackMode === 'hls') {
+      return IMMICH_HLS_PROXY_URL + imageId + '/main.m3u8?v=' + encodeURIComponent(version || '');
+    }
     return IMMICH_VIDEO_PROXY_URL + imageId + `?v=${encodeURIComponent(version || '')}`;
   }
 };

@@ -282,7 +282,7 @@ function _setCacheProtection(immichApi, tiles) {
   if (immichApi.videoCache) {
     const videos = assets
       .filter((tile) => tile && tile.kind === 'video')
-      .map((tile) => ({ ...tile, cacheVariant: 'video' }));
+      .map((tile) => ({ ...tile, cacheVariant: immichApi.videoCacheVariant || 'video' }));
     immichApi.videoCache.setProtectedAssets(videos);
   }
 }
@@ -301,7 +301,7 @@ function _logPrefetchResults(results) {
     Log.warn(LOG_PREFIX + `${summary.previewFailed} album preview(s) were not cached.`);
   }
   if (summary.videosFailed) {
-    Log.warn(LOG_PREFIX + `${summary.videosFailed}/${summary.videosRequested} album video(s) were not cached; they may stream from Immich.`);
+    Log.warn(LOG_PREFIX + `${summary.videosFailed}/${summary.videosRequested} album video(s) were not cached; they may be requested directly from Immich's playback endpoint.`);
   } else if (summary.videosRequested) {
     Log.info(LOG_PREFIX + `Album video cache ready (${summary.videosCached}/${summary.videosRequested}).`);
   }

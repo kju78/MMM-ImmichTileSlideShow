@@ -109,3 +109,23 @@ test('rejects invalid video-cache size limits', () => {
     cache: { previewMaxBytes: 0 }
   }), /cache\.previewMaxBytes must be a positive safe integer/);
 });
+
+test('allows disabling original-video fallback', () => {
+  assert.equal(normalize({ immich: albumConfig }).videos.fallbackToOriginal, true);
+  assert.equal(normalize({
+    immich: albumConfig,
+    videos: { fallbackToOriginal: false }
+  }).videos.fallbackToOriginal, false);
+});
+
+test('normalizes and validates the video playback mode', () => {
+  assert.equal(normalize({ immich: albumConfig }).videos.playbackMode, 'playback');
+  assert.equal(normalize({
+    immich: albumConfig,
+    videos: { playbackMode: 'HLS' }
+  }).videos.playbackMode, 'hls');
+  assert.throws(() => normalize({
+    immich: albumConfig,
+    videos: { playbackMode: 'unknown' }
+  }), /videos\.playbackMode must be "playback" or "hls"/);
+});

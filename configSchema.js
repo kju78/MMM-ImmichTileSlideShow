@@ -316,10 +316,17 @@
       autoplay: true,
       muted: true,
       loop: true,
-      preload: 'metadata'
+      preload: 'metadata',
+      playbackMode: 'playback',
+      fallbackToOriginal: true
     }, true);
     videos.centerBand = videos.centerBand == null ? null : toFraction(videos.centerBand, null);
     videos.maxConcurrent = Math.max(0, Number(videos.maxConcurrent) || 0);
+    videos.playbackMode = String(videos.playbackMode || 'playback').toLowerCase();
+    if (!['playback', 'hls'].includes(videos.playbackMode)) {
+      throw new Error('videos.playbackMode must be "playback" or "hls".');
+    }
+    videos.fallbackToOriginal = videos.fallbackToOriginal !== false;
 
     const scroll = group(raw.scroll, { speed: 18 }, false);
     scroll.speed = Number(scroll.speed) > 0 ? Number(scroll.speed) : 18;

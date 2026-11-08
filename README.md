@@ -162,6 +162,10 @@ Grouped options accept `true`, `false`, **or** an object of settings — so `vid
 | `randomize` | boolean | `true` | Swap a random tile each interval instead of cycling in order. |
 | `staggerMs` | number | `250` | Stagger between tiles during the initial fill. |
 
+Incoming images are loaded and decoded in the browser before a tile is changed
+or faded in. This only preloads media being shown in visible tiles; it does not
+decode the entire album into browser memory.
+
 ### Captions
 
 | Name | Type | Default | Description |
@@ -190,6 +194,8 @@ Grouped options accept `true`, `false`, **or** an object of settings — so `vid
 | `videos.maxConcurrent` | number | `1` | Cap on simultaneously playing videos — **keep low on a Pi**. |
 | `videos.autoplay` / `muted` / `loop` | boolean | `true` | Standard HTML5 video behavior. `muted` is required by most autoplay policies. |
 | `videos.preload` | string | `"metadata"` | `"none"`, `"metadata"`, or `"auto"`. |
+| `videos.playbackMode` | string | `"playback"` | `"playback"` uses Immich's normal video endpoint; `"hls"` uses Immich v3 real-time HLS transcoding. |
+| `videos.fallbackToOriginal` | boolean | `true` | Try the original video if Immich's playback endpoint fails. Set `false` to require the playback endpoint only. |
 
 ### Scrolling
 
@@ -265,8 +271,9 @@ without waiting for full video downloads; video poster tiles appear immediately,
 and each video is added after its cache attempt finishes, so a large video
 cannot keep the screen on placeholders.
 The next album is fully prefetched before the scheduled switch. Videos that are
-too large, unavailable, or blocked by the cache limit still stream from Immich;
-the helper logs when a video could not be cached.
+too large or blocked by the cache limit still use Immich's playback endpoint
+directly. Set `videos.fallbackToOriginal: false` to prevent original-file
+fallback; playback and cache failures are logged.
 Cached video responses support HTTP byte ranges for playback and seeking.
 Both the active and next albums are protected while the next album is prepared,
 so size the video cache to hold both. The preview and video limits are
@@ -310,10 +317,10 @@ config: {
 
 ## Immich integration
 
-The module detects your Immich version and picks the right endpoints, then proxies media through MagicMirror so no credentials reach the browser.
+The module detects your Immich version and proxies media requests through MagicMirror's Node helper. The API key is not embedded in proxied media URLs. However, MagicMirror sends module configuration to its browser frontend, so do not treat `immich.apiKey` as hidden from clients that can inspect the mirror; use a read-only key and restrict access to trusted clients.
 
 - **Images** — proxied Immich thumbnails. With `performance.lightweight`, the smaller `thumbnail` is tried first, then `preview`, then the original. Otherwise `preview` first.
-- **Videos** — the encoded video stream (v1.x `/assets/{id}/video`, v3+ `/assets/{id}/video/playback`) with a thumbnail poster. Posters use the preview cache; full streams can be downloaded to the optional, separately bounded video cache.
+- **Videos** — by default, the encoded video stream (v1.x `/assets/{id}/video`, v3+ `/assets/{id}/video/playback`) with a thumbnail poster. `videos.playbackMode: "hls"` uses Immich v3 real-time HLS instead. Posters use the preview cache; standard full streams can be downloaded to the optional, separately bounded video cache.
 - **Large albums** — on Immich v3+, album assets are paged via `/search/metadata`. Without local caching, pages stream as they arrive; with caching enabled, the album waits for its preview/video prefetches before rendering.
 - **Local caching** — previews and videos are keyed by asset version. Cached videos are served from disk with HTTP Range support; uncached or oversized videos fall back to the Immich stream. The next selected album is loaded and cached before the scheduled switch.
 
@@ -330,6 +337,8 @@ When creating the key in Immich (**Account → API Keys**), grant:
 | `memory.read` | `source: "memory"` |
 
 On pre-v3 servers `asset.read` also covers thumbnails and originals — the `asset.view` / `asset.download` split arrived in v3.
+
+Configure `immich.apiKey` in MagicMirror from a local secret source. Never commit the actual key to this module repository or paste it into documentation.
 
 ## Tests
 
@@ -448,11 +457,28 @@ config: {
 }
 ```
 
-For a Raspberry Pi 4, use Immich's server-side video transcoding to produce
-H.264 playback at 720p first; try 1080p only if playback stays smooth. The
-slideshow caches the playback response by asset version, so clear
-`cache.directory/videos` after changing Immich's transcoding settings to avoid
-reusing previously cached 4K streams.
+By default, `videos.playbackMode: "playback"` uses Immich's standard video
+endpoint, which serves an existing encoded file or the original. Immich's
+**Real-time Transcoding → Resolutions** setting does not affect this endpoint.
+To use live 480p transcoding while leaving the normal stored-video resolution
+unchanged, configure:
+
+```js
+videos: {
+  playbackMode: "hls",
+  fallbackToOriginal: false,
+  maxConcurrent: 1,
+  preload: "none"
+}
+```
+
+This mode requires Immich v3+, real-time transcoding enabled, and `480p`
+selected under **Real-time Transcoding → Resolutions**. Immich's HLS endpoint
+is experimental and requires streaming metadata for each video. If Immich
+reports that metadata is not ready, the module logs the failure and leaves the
+poster visible; it does not fall back to the standard playback endpoint or the
+original file. HLS playlists and segments are proxied through MagicMirror and
+are not stored in the module's full-video cache (`cache.videoMaxBytes`).
 
 For the smoothest result, run MagicMirror in server mode on a stronger machine and point the Pi's browser at it.
 
